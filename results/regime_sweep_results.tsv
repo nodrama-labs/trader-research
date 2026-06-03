@@ -1,0 +1,7 @@
+experiment_id	observation	K	emission	transitions	regime_score	score_2018_bear	score_2020q1_covid	score_bull_2020_2021	score_2022_bear	score_2024_etf_bull	ll_mean	argmax_acc	flip_count	comment
+exp_001_baseline	drawdown_200	3	gaussian	homogeneous	-inf	0.244892	0.000000	0.804089	0.520372	0.881332	nan	0.522687	39	Baseline: K=3 Gaussian on rolling-200 drawdown, mu-sort labelling. From regime_drawdown_2022.org.
+exp_002_proposal_k3	trivar_r_vol5_dd200	3	mvn_full	nh_softmax_vix	-inf	0.389914	0.206900	0.695765	0.869081	0.083323	nan	0.462665	86	Proposal: K=3 full-Sigma MVN on (r,vol5,dd200), NH-HMM softmax(VIX). Return-sort labelling.
+exp_003_multivariate_only	trivar_r_vol5_dd200	3	mvn_full	homogeneous	-inf	0.423901	0.000000	0.764652	0.628659	0.876741	nan	0.555913	85	Ablation: multivariate obs alone (trivar MVN, homogeneous A). Isolates the observation channel.
+exp_004_nh_only	drawdown_200	3	gaussian	nh_softmax_vix	-inf	0.076050	0.000000	0.795748	0.000007	0.992943	nan	0.464094	41	Ablation: NH transitions alone (drawdown-200 univariate, softmax(VIX) A). Isolates the transition.
+exp_005_mvt_homog	trivar_r_vol5_dd200	3	mvt_full	homogeneous	-inf	0.259444	0.000002	0.814857	0.903870	0.992153	nan	0.568417	40	Phase3: K=3 multivariate Student-t (full Sigma, per-state nu), homogeneous A. Fat tails to crack COVID.
+exp_006_mvt_nh	trivar_r_vol5_dd200	3	mvt_full	nh_softmax_vix	-inf	0.395252	0.023293	0.772034	0.901582	0.000000	nan	0.490175	29	Phase3 capstone: K=3 multivariate Student-t + NH-HMM softmax(VIX). COVID-cracker x fat-tail smoothness.
