@@ -1,8 +1,9 @@
 """Fetch BTCUSDT daily candles from Binance into data/btcusdt_daily.csv.
 
-Phase 0 needs 2021-06 → 2023-06 (~2 years wrapping the 2022 bear).
-Later phases extend to 2017-08 → 2025-12. Keeping the fetch window
-parametric here so Day 2 can widen without rewriting.
+Autoresearch iteration 2 window: 2017-08-17 → 2025-12-31. Covers all
+five consensus regime periods (2018 bear, 2020-Q1 COVID, 2020-Q2 →
+2021-Q4 bull, 2022 bear, 2024 post-ETF bull) plus the rolling-200-day
+drawdown warm-up.
 """
 
 import os
@@ -15,9 +16,9 @@ BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 SYMBOL = "BTCUSDT"
 INTERVAL = "1d"
 
-# Phase 0 window: 2021-06-01 → 2023-06-30 inclusive.
-START_MS = int(pd.Timestamp("2021-06-01", tz="UTC").timestamp() * 1000)
-END_MS = int(pd.Timestamp("2023-06-30", tz="UTC").timestamp() * 1000)
+# Iteration-2 window: 2017-08-17 (BTCUSDT launch on Binance) → 2025-12-31.
+START_MS = int(pd.Timestamp("2017-08-17", tz="UTC").timestamp() * 1000)
+END_MS = int(pd.Timestamp("2025-12-31", tz="UTC").timestamp() * 1000)
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "btcusdt_daily.csv")
 
