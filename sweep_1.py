@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
-from harness import (
+from harness_1 import (
     DATA_PATH,
     FEE_RATE,
     INITIAL_CAPITAL,

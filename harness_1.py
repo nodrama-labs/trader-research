@@ -44,7 +44,7 @@ import pandas as pd
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(REPO_ROOT, "data", "bear_portfolio_candles.csv")
-RESULTS_PATH = os.path.join(REPO_ROOT, "results", "bear_sweep_results.tsv")
+RESULTS_PATH = os.path.join(REPO_ROOT, "results", "bear_sweep_results_1.tsv")
 
 
 # ---------------------------------------------------------------------------
