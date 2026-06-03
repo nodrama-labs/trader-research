@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq, minimize
-from scipy.special import digamma, logsumexp
+from scipy.special import digamma, gammaln, logsumexp
 from scipy.stats import t as student_t
 from sklearn.cluster import KMeans
 
@@ -629,7 +629,155 @@ def fit_homog_mvn_with_restarts(X, K, n_restarts=3, seed=20260603,
 
 
 # ---------------------------------------------------------------------------
-# Proposal model — MVN emissions + (NH or homogeneous) transitions, filtering
+# Multivariate Student-t emissions (fat tails, paper 3) + ECM M-step
+# ---------------------------------------------------------------------------
+
+NU_MIN = 2.05         # keep finite covariance (ν>2); below this the t has no var
+NU_MAX = 200.0        # ν>=this is numerically Gaussian — clamp & treat as such
+
+
+def _mahalanobis(X, mu, Sigma):
+    """(x_t-μ)^T Σ^{-1} (x_t-μ) for all t, plus logdet(Σ). Cholesky-based."""
+    L = np.linalg.cholesky(Sigma)
+    diff = (X - mu).T                                  # (D, T)
+    z = solve_triangular(L, diff, lower=True)          # (D, T)
+    maha = np.sum(z * z, axis=0)                       # (T,)
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return maha, logdet
+
+
+def mvt_log_emissions(X, mu, Sigma, nu):
+    """Log pdf of the D-variate Student-t per (t, k).
+
+    X:(T,D)  mu:(K,D)  Sigma:(K,D,D) scale matrices  nu:(K,) dof  -> (T,K).
+    """
+    T, D = X.shape
+    K = mu.shape[0]
+    log_B = np.empty((T, K))
+    for k in range(K):
+        maha, logdet = _mahalanobis(X, mu[k], Sigma[k])
+        nk = nu[k]
+        log_B[:, k] = (
+            gammaln((nk + D) / 2.0) - gammaln(nk / 2.0)
+            - 0.5 * D * np.log(nk * np.pi)
+            - 0.5 * logdet
+            - 0.5 * (nk + D) * np.log1p(maha / nk)
+        )
+    return log_B
+
+
+def _solve_nu(c, lo=NU_MIN, hi=NU_MAX):
+    """Solve log(ν/2) − digamma(ν/2) + c = 0 for ν. The LHS is +∞ at ν→0 and
+    →0⁺ as ν→∞, so a root exists iff c < 0; otherwise ν→∞ (Gaussian), clamp hi."""
+    def f(nu):
+        return np.log(nu / 2.0) - digamma(nu / 2.0) + c
+    flo, fhi = f(lo), f(hi)
+    if flo * fhi > 0:
+        # No sign change: pick the bound the function is heading toward.
+        return hi if abs(fhi) < abs(flo) else lo
+    return brentq(f, lo, hi, maxiter=100)
+
+
+def m_step_mvt(X, log_gamma, mu, Sigma, nu, reg: float = 1e-4):
+    """One ECM update for K multivariate-t states given HMM responsibilities.
+
+    Uses the Peel-McLachlan latent-scale weights u_tk = (ν_k+D)/(ν_k+maha_tk),
+    re-weighting the Gaussian-style mean/scale updates and solving the dof
+    fixed-point per state. Returns (mu_new, Sigma_new, nu_new)."""
+    gamma = np.exp(log_gamma)                          # (T, K)
+    T, D = X.shape
+    K = mu.shape[0]
+    mu_new = np.empty_like(mu)
+    Sigma_new = np.empty_like(Sigma)
+    nu_new = np.empty_like(nu)
+    eye = np.eye(D)
+    for k in range(K):
+        maha, _ = _mahalanobis(X, mu[k], Sigma[k])
+        u = (nu[k] + D) / (nu[k] + maha)               # (T,) latent precisions
+        g = gamma[:, k]
+        gu = g * u
+        Sgu = gu.sum() + 1e-12
+        Nk = g.sum() + 1e-12
+        mk = (gu[:, None] * X).sum(axis=0) / Sgu
+        diff = X - mk
+        Sk = (gu[:, None] * diff).T @ diff / Nk        # scale matrix (γu weighted, /Σγ)
+        Sk = Sk + reg * eye
+        mu_new[k] = mk
+        Sigma_new[k] = Sk
+        # dof fixed-point: constant term from current-iter u, ν.
+        c = (1.0 + (g * (np.log(u) - u)).sum() / Nk
+             + digamma((nu[k] + D) / 2.0) - np.log((nu[k] + D) / 2.0))
+        nu_new[k] = _solve_nu(c)
+    return mu_new, Sigma_new, nu_new
+
+
+@dataclass
+class HomogMVTFit:
+    log_pi: np.ndarray
+    log_A: np.ndarray
+    mu: np.ndarray
+    Sigma: np.ndarray           # scale matrices
+    nu: np.ndarray              # (K,) per-state dof
+    log_likelihood: float
+    n_iter: int
+    converged: bool
+    family: str = "mvt_homog"
+
+
+def baum_welch_homog_mvt(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
+                         nu_init: float = 8.0, init: Optional["HomogMVTFit"] = None):
+    """EM for a K-state multivariate Student-t HMM, homogeneous transitions.
+
+    Initialised from a Gaussian k-means seed with a moderately fat ν₀; each EM
+    iteration runs the standard forward-backward with t-pdf emissions then the
+    ECM mean/scale/dof update."""
+    if init is not None:
+        mu = init.mu.copy(); Sigma = init.Sigma.copy()
+        log_pi = init.log_pi.copy(); log_A = init.log_A.copy(); nu = init.nu.copy()
+    else:
+        assert rng is not None, "rng required for cold-start init"
+        mu, Sigma, pi = kmeans_init_mvn(X, K, rng, jitter=jitter)
+        log_pi = np.log(pi + 1e-12)
+        A0 = np.full((K, K), 0.05 / (K - 1)); np.fill_diagonal(A0, 0.95)
+        log_A = np.log(A0 + 1e-12)
+        nu = np.full(K, float(nu_init))
+
+    prev_ll = -np.inf
+    converged = False
+    it = 0
+    for it in range(max_iter):
+        log_B = mvt_log_emissions(X, mu, Sigma, nu)
+        log_gamma, log_xi, ll = forward_backward(log_pi, log_A, log_B)
+        log_pi, log_A = m_step_init_trans(log_gamma, log_xi)
+        mu, Sigma, nu = m_step_mvt(X, log_gamma, mu, Sigma, nu)
+        if np.isfinite(ll) and abs(ll - prev_ll) < tol:
+            converged = True
+            it += 1
+            break
+        prev_ll = ll
+    return HomogMVTFit(log_pi, log_A, mu, Sigma, nu, ll, it, converged)
+
+
+def fit_homog_mvt_with_restarts(X, K, n_restarts=3, seed=20260603,
+                                init: Optional["HomogMVTFit"] = None):
+    if init is not None:
+        return baum_welch_homog_mvt(X, K, init=init, max_iter=40)
+    best = None
+    master = np.random.default_rng(seed)
+    for r in range(n_restarts):
+        rng = np.random.default_rng(master.integers(1 << 31))
+        jitter = 0.0 if r == 0 else 0.25
+        fit = baum_welch_homog_mvt(X, K, rng=rng, jitter=jitter)
+        if best is None or (np.isfinite(fit.log_likelihood) and
+                            fit.log_likelihood > best.log_likelihood):
+            best = fit
+    if best is None:
+        raise RuntimeError("all homogeneous-MVT restarts failed")
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Proposal model — MVN/MVT emissions + (NH or homogeneous) transitions, filtering
 # ---------------------------------------------------------------------------
 
 class ProposalModel:
@@ -654,6 +802,7 @@ class ProposalModel:
         self.K = K
         self.feature_fn = feature_fn if feature_fn is not None else trivariate_features
         self.is_nh = hasattr(fit, "W")                 # NH fit carries softmax W
+        self.is_mvt = hasattr(fit, "nu")               # Student-t fit carries dof
         order = np.argsort(fit.mu[:, order_channel])   # by return (or drawdown) channel
         # Map each state -> canonical column. For K=3: order[0]=bear, [1]=ranging,
         # [2]=bull. For K>3, first third -> bear, last third -> bull, middle -> ranging.
@@ -687,7 +836,10 @@ class ProposalModel:
             return np.full((len(data), 3), np.nan)
 
         Xz, Xc = self._standardize(F[valid], vix[valid])
-        log_B = mvn_log_emissions(Xz, self.fit.mu, self.fit.Sigma)
+        if self.is_mvt:
+            log_B = mvt_log_emissions(Xz, self.fit.mu, self.fit.Sigma, self.fit.nu)
+        else:
+            log_B = mvn_log_emissions(Xz, self.fit.mu, self.fit.Sigma)
         if self.is_nh:
             log_A_seq = nh_log_A_seq(self.fit.W, Xc)
             log_alpha = forward_nh(self.fit.log_pi, log_A_seq, log_B)
@@ -707,14 +859,20 @@ class ProposalModel:
 
 def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
                           feature_fn=None, transitions: str = "nh",
-                          order_channel: int = 0):
-    """Stateful factory for the MVN proposal family: cold-start k-means +
+                          emission: str = "mvn", order_channel: int = 0):
+    """Stateful factory for the MVN/MVT proposal family: cold-start k-means +
     jittered restarts on the first call, warm-start single-EM thereafter (the
     walk-forward tractability trick from the baseline, carried over here).
 
     `transitions` selects 'nh' (softmax-VIX, exp_002/exp_004) or 'homog'
-    (closed-form, exp_003). `feature_fn` selects the observation channels
-    (trivariate by default; drawdown-only for exp_004)."""
+    (closed-form, exp_003/exp_005). `emission` selects 'mvn' (Gaussian) or 'mvt'
+    (Student-t, exp_005). `feature_fn` selects the observation channels
+    (trivariate by default; drawdown-only for exp_004).
+
+    Note: 'mvt' is only wired for homogeneous transitions (the Student-t ECM
+    M-step + softmax-transition optimise are not combined in this iteration)."""
+    if emission == "mvt" and transitions != "homog":
+        raise NotImplementedError("mvt emission is only wired for homogeneous transitions")
     if feature_fn is None:
         feature_fn = trivariate_features
     state = {"last_fit": None}
@@ -742,10 +900,14 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
             else:
                 fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, init=state["last_fit"])
         elif transitions == "homog":
-            if state["last_fit"] is None:
-                fit = fit_homog_mvn_with_restarts(Xz, K=K, n_restarts=n_restarts_cold)
+            if emission == "mvt":
+                fit_fn = fit_homog_mvt_with_restarts
             else:
-                fit = fit_homog_mvn_with_restarts(Xz, K=K, init=state["last_fit"])
+                fit_fn = fit_homog_mvn_with_restarts
+            if state["last_fit"] is None:
+                fit = fit_fn(Xz, K=K, n_restarts=n_restarts_cold)
+            else:
+                fit = fit_fn(Xz, K=K, init=state["last_fit"])
         else:
             raise ValueError(f"unknown transitions={transitions!r}")
 
@@ -834,11 +996,37 @@ def run_exp_004_nh_only() -> None:
     )
 
 
+def run_exp_005_mvt_homog() -> None:
+    """Phase 3: K=3 multivariate Student-t (full scale Σ, per-state dof ν) on
+    (rₜ, σₜ^{5d}, dₜ_{200}) with homogeneous transitions.
+
+    Hypothesis: exp_003 (Gaussian, homogeneous, multivariate) was one period from
+    a finite score — only COVID (0.000) failed, because the 28-day fat-tailed
+    crash gives every Gaussian state vanishing likelihood, so the sticky filter
+    never switches to bear. Fat-tailed t emissions should let the bear state
+    claim the COVID extremes (and the deep 2018/2022 tails) without disturbing
+    exp_003's preserved 2024 bull — no NH transition, so no calm-VIX 2024 collapse."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3,
+                                    feature_fn=trivariate_features,
+                                    transitions="homog", emission="mvt",
+                                    order_channel=0)
+    harness.evaluate(
+        experiment_id="exp_005_mvt_homog",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvt_full",
+        transitions="homogeneous",
+        comment="Phase3: K=3 multivariate Student-t (full Sigma, per-state nu), homogeneous A. Fat tails to crack COVID.",
+    )
+
+
 EXPERIMENTS = {
     "exp_001_baseline": run_exp_001_baseline,
     "exp_002_proposal_k3": run_exp_002_proposal_k3,
     "exp_003_multivariate_only": run_exp_003_multivariate_only,
     "exp_004_nh_only": run_exp_004_nh_only,
+    "exp_005_mvt_homog": run_exp_005_mvt_homog,
 }
 
 

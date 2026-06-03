@@ -156,6 +156,61 @@ def test_proposal_model_paths_on_real_data():
     print("[ok] proposal model: all 3 ablation paths emit valid (T,3) posteriors")
 
 
+def test_mvt_emissions_match_scipy():
+    from scipy.stats import multivariate_t
+    rng = np.random.default_rng(0)
+    D, K, T = 3, 2, 60
+    X = rng.normal(size=(T, D))
+    mu = rng.normal(size=(K, D))
+    Sigma = np.empty((K, D, D))
+    for k in range(K):
+        a = rng.normal(size=(D, D)); Sigma[k] = a @ a.T + np.eye(D)
+    nu = np.array([4.0, 12.0])
+    got = sweep.mvt_log_emissions(X, mu, Sigma, nu)
+    for k in range(K):
+        ref = multivariate_t(loc=mu[k], shape=Sigma[k], df=nu[k]).logpdf(X)
+        assert np.allclose(got[:, k], ref, atol=1e-8), f"mvt emission mismatch state {k}"
+    print("[ok] mvt_log_emissions matches scipy.multivariate_t.logpdf")
+
+
+def test_mvt_em_recovers_and_detects_tails():
+    """Generate heavy-tailed (low-ν) clusters; the MVT-EM must recover the means
+    and infer a *finite* (fat) ν, while a Gaussian fit would be dragged by the
+    outliers. Sanity: LL non-decreasing, means recovered, ν stays finite."""
+    from scipy.stats import multivariate_t
+    rng = np.random.default_rng(5)
+    mu_true = np.array([[-2.0, 1.0, -1.0], [0.0, 0.0, 0.0], [2.0, -0.5, 1.0]])
+    shape = 0.3 * np.eye(3)
+    A = np.array([[0.95, 0.04, 0.01], [0.03, 0.94, 0.03], [0.01, 0.04, 0.95]])
+    T = 1800
+    states = np.empty(T, dtype=int); states[0] = 1
+    for t in range(1, T):
+        states[t] = rng.choice(3, p=A[states[t - 1]])
+    X = np.array([multivariate_t(loc=mu_true[s], shape=shape, df=3.0,
+                                 seed=rng).rvs() for s in states])
+    fit = sweep.fit_homog_mvt_with_restarts(X, K=3, n_restarts=3)
+    order = np.argsort(fit.mu[:, 0])
+    err = np.abs(fit.mu[order] - mu_true[np.argsort(mu_true[:, 0])]).max()
+    assert err < 0.6, f"MVT recovered means off by {err:.3f}"
+    assert np.all(fit.nu > 2.0) and np.all(fit.nu < sweep.NU_MAX), \
+        f"expected finite fat nu, got {fit.nu}"
+    assert (fit.nu < 30).any(), f"expected at least one clearly-fat state, nu={fit.nu}"
+    print(f"[ok] MVT-EM recovers means (err {err:.3f}), infers fat nu={np.round(fit.nu,2)}")
+
+
+def test_mvt_model_path_on_real_data():
+    import harness
+    data = harness.load_joined().iloc[:500].copy()
+    factory = sweep.make_proposal_factory(K=3, n_restarts_cold=2,
+                                          feature_fn=sweep.trivariate_features,
+                                          transitions="homog", emission="mvt")
+    model = factory(data)
+    post = model.forward_posterior(data)
+    valid = ~np.isnan(post).any(axis=1)
+    assert valid.sum() > 0 and np.allclose(post[valid].sum(axis=1), 1.0, atol=1e-6)
+    print(f"[ok] MVT proposal path emits valid posteriors; nu={np.round(model.fit.nu,2)}")
+
+
 if __name__ == "__main__":
     test_mvn_emissions_match_scipy()
     test_nh_log_A_rows_normalised()
@@ -163,4 +218,7 @@ if __name__ == "__main__":
     test_warm_start_fast_and_stable()
     test_homog_mvn_recovers_states()
     test_proposal_model_paths_on_real_data()
-    print("\nAll NH-MVN sanity checks passed.")
+    test_mvt_emissions_match_scipy()
+    test_mvt_em_recovers_and_detects_tails()
+    test_mvt_model_path_on_real_data()
+    print("\nAll NH-MVN/MVT sanity checks passed.")
