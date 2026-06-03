@@ -117,9 +117,50 @@ def test_warm_start_fast_and_stable():
     print(f"[ok] warm-start: {warm.n_iter} iters, LL {cold.log_likelihood:.1f} -> {warm.log_likelihood:.1f}")
 
 
+def test_homog_mvn_recovers_states():
+    """The homogeneous-MVN driver (exp_003 ablation) must recover the same
+    synthetic states as the NH driver on the homogeneous-generating process."""
+    rng = np.random.default_rng(7)
+    X, Xc, states, mu_true = simulate_nh_mvn(rng)
+    fit = sweep.fit_homog_mvn_with_restarts(X, K=3, n_restarts=3)
+    order = np.argsort(fit.mu[:, 0])
+    mu_sorted = fit.mu[order]
+    mu_true_sorted = mu_true[np.argsort(mu_true[:, 0])]
+    err = np.abs(mu_sorted - mu_true_sorted).max()
+    assert err < 0.5, f"homog recovered means off by {err:.3f}"
+    # transition rows normalised
+    assert np.allclose(np.exp(logsumexp(fit.log_A, axis=1)), 1.0, atol=1e-9)
+    print(f"[ok] homogeneous-MVN recovers state means (max abs err {err:.3f})")
+
+
+def test_proposal_model_paths_on_real_data():
+    """Both transition modes + both feature sets build and emit valid (T,3)
+    posteriors (rows sum to 1 on valid days) on a real training slice."""
+    import harness
+    data = harness.load_joined().iloc[:500].copy()  # enough for a 200-dd warmup
+    configs = [
+        (sweep.trivariate_features, "nh"),
+        (sweep.trivariate_features, "homog"),
+        (sweep.drawdown_only_features, "nh"),
+    ]
+    for feat_fn, trans in configs:
+        factory = sweep.make_proposal_factory(K=3, n_restarts_cold=2,
+                                              feature_fn=feat_fn, transitions=trans)
+        model = factory(data)
+        post = model.forward_posterior(data)
+        valid = ~np.isnan(post).any(axis=1)
+        assert valid.sum() > 0, f"no valid posteriors ({feat_fn.__name__},{trans})"
+        rs = post[valid].sum(axis=1)
+        assert np.allclose(rs, 1.0, atol=1e-6), f"rows must sum to 1 ({trans})"
+        assert (post[valid] >= -1e-9).all(), "posteriors must be non-negative"
+    print("[ok] proposal model: all 3 ablation paths emit valid (T,3) posteriors")
+
+
 if __name__ == "__main__":
     test_mvn_emissions_match_scipy()
     test_nh_log_A_rows_normalised()
     test_em_recovers_states()
     test_warm_start_fast_and_stable()
+    test_homog_mvn_recovers_states()
+    test_proposal_model_paths_on_real_data()
     print("\nAll NH-MVN sanity checks passed.")

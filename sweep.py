@@ -85,6 +85,17 @@ def trivariate_features(data: pd.DataFrame):
     return F, valid
 
 
+def drawdown_only_features(data: pd.DataFrame):
+    """Univariate rolling-200 drawdown observation (the baseline's channel),
+    shaped (T, 1) for the multivariate code path. Used by exp_004's NH-only
+    ablation so it shares the proposal's transition machinery on the *baseline's*
+    observation."""
+    dd = rolling_drawdown(data["log_price"].to_numpy(), DRAWDOWN_WINDOW)
+    F = dd[:, None]
+    valid = ~np.isnan(F).any(axis=1)
+    return F, valid
+
+
 def vix_covariate(data: pd.DataFrame) -> np.ndarray:
     """Raw VIX close aligned to `data`'s rows, with leading/embedded NaN handled.
 
@@ -549,7 +560,76 @@ def fit_nh_mvn_with_restarts(X, Xc, K, n_restarts=3, seed=20260603,
 
 
 # ---------------------------------------------------------------------------
-# Proposal model — trivariate MVN emissions + NH transitions, forward filtering
+# Homogeneous MVN Baum-Welch (exp_003 ablation: multivariate obs, fixed A)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HomogMVNFit:
+    log_pi: np.ndarray          # (K,)
+    log_A: np.ndarray           # (K, K) homogeneous transitions
+    mu: np.ndarray              # (K, D)
+    Sigma: np.ndarray           # (K, D, D)
+    log_likelihood: float
+    n_iter: int
+    converged: bool
+    family: str = "mvn_homog"
+
+
+def baum_welch_homog_mvn(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
+                         init: Optional["HomogMVNFit"] = None):
+    """EM for a K-state multivariate-Gaussian HMM with homogeneous transitions.
+
+    Same emission body and warm-start discipline as the NH driver, but the
+    transition M-step is the closed-form normalised-xi update (no inner optimise)."""
+    if init is not None:
+        mu = init.mu.copy()
+        Sigma = init.Sigma.copy()
+        log_pi = init.log_pi.copy()
+        log_A = init.log_A.copy()
+    else:
+        assert rng is not None, "rng required for cold-start init"
+        mu, Sigma, pi = kmeans_init_mvn(X, K, rng, jitter=jitter)
+        log_pi = np.log(pi + 1e-12)
+        A0 = np.full((K, K), 0.05 / (K - 1))
+        np.fill_diagonal(A0, 0.95)
+        log_A = np.log(A0 + 1e-12)
+
+    prev_ll = -np.inf
+    converged = False
+    it = 0
+    for it in range(max_iter):
+        log_B = mvn_log_emissions(X, mu, Sigma)
+        log_gamma, log_xi, ll = forward_backward(log_pi, log_A, log_B)
+        log_pi, log_A = m_step_init_trans(log_gamma, log_xi)
+        mu, Sigma = m_step_mvn(X, log_gamma)
+        if np.isfinite(ll) and abs(ll - prev_ll) < tol:
+            converged = True
+            it += 1
+            break
+        prev_ll = ll
+    return HomogMVNFit(log_pi, log_A, mu, Sigma, ll, it, converged)
+
+
+def fit_homog_mvn_with_restarts(X, K, n_restarts=3, seed=20260603,
+                                init: Optional["HomogMVNFit"] = None):
+    if init is not None:
+        return baum_welch_homog_mvn(X, K, init=init, max_iter=40)
+    best = None
+    master = np.random.default_rng(seed)
+    for r in range(n_restarts):
+        rng = np.random.default_rng(master.integers(1 << 31))
+        jitter = 0.0 if r == 0 else 0.25
+        fit = baum_welch_homog_mvn(X, K, rng=rng, jitter=jitter)
+        if best is None or (np.isfinite(fit.log_likelihood) and
+                            fit.log_likelihood > best.log_likelihood):
+            best = fit
+    if best is None:
+        raise RuntimeError("all homogeneous-MVN restarts failed")
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Proposal model — MVN emissions + (NH or homogeneous) transitions, filtering
 # ---------------------------------------------------------------------------
 
 class ProposalModel:
@@ -564,14 +644,17 @@ class ProposalModel:
     statistics stored at fit time, so applying the model forward stays causal.
     """
 
-    def __init__(self, fit: NHMVNFit, feat_mean, feat_std, vix_mean, vix_std, K):
+    def __init__(self, fit, feat_mean, feat_std, vix_mean, vix_std, K,
+                 feature_fn=None, order_channel: int = 0):
         self.fit = fit
         self.feat_mean = feat_mean
         self.feat_std = feat_std
         self.vix_mean = vix_mean
         self.vix_std = vix_std
         self.K = K
-        order = np.argsort(fit.mu[:, 0])               # by return channel
+        self.feature_fn = feature_fn if feature_fn is not None else trivariate_features
+        self.is_nh = hasattr(fit, "W")                 # NH fit carries softmax W
+        order = np.argsort(fit.mu[:, order_channel])   # by return (or drawdown) channel
         # Map each state -> canonical column. For K=3: order[0]=bear, [1]=ranging,
         # [2]=bull. For K>3, first third -> bear, last third -> bull, middle -> ranging.
         col = np.empty(K, dtype=int)
@@ -598,15 +681,18 @@ class ProposalModel:
         return Xz, Xc
 
     def forward_posterior(self, data: pd.DataFrame) -> np.ndarray:
-        F, valid = trivariate_features(data)
+        F, valid = self.feature_fn(data)
         vix = vix_covariate(data)
         if valid.sum() < 2:
             return np.full((len(data), 3), np.nan)
 
         Xz, Xc = self._standardize(F[valid], vix[valid])
         log_B = mvn_log_emissions(Xz, self.fit.mu, self.fit.Sigma)
-        log_A_seq = nh_log_A_seq(self.fit.W, Xc)
-        log_alpha = forward_nh(self.fit.log_pi, log_A_seq, log_B)
+        if self.is_nh:
+            log_A_seq = nh_log_A_seq(self.fit.W, Xc)
+            log_alpha = forward_nh(self.fit.log_pi, log_A_seq, log_B)
+        else:
+            log_alpha = forward(self.fit.log_pi, self.fit.log_A, log_B)
         log_post = log_alpha - logsumexp(log_alpha, axis=1, keepdims=True)
         post = np.exp(log_post)                         # (T_valid, K)
 
@@ -619,14 +705,22 @@ class ProposalModel:
         return full
 
 
-def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3):
-    """Stateful factory for the NH-MVN proposal: cold-start k-means + jittered
-    restarts on the first call, warm-start single-EM thereafter (the walk-forward
-    tractability trick from the baseline, carried over to the NH-MVN body)."""
+def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
+                          feature_fn=None, transitions: str = "nh",
+                          order_channel: int = 0):
+    """Stateful factory for the MVN proposal family: cold-start k-means +
+    jittered restarts on the first call, warm-start single-EM thereafter (the
+    walk-forward tractability trick from the baseline, carried over here).
+
+    `transitions` selects 'nh' (softmax-VIX, exp_002/exp_004) or 'homog'
+    (closed-form, exp_003). `feature_fn` selects the observation channels
+    (trivariate by default; drawdown-only for exp_004)."""
+    if feature_fn is None:
+        feature_fn = trivariate_features
     state = {"last_fit": None}
 
     def factory(train_data: pd.DataFrame) -> ProposalModel:
-        F, valid = trivariate_features(train_data)
+        F, valid = feature_fn(train_data)
         vix = vix_covariate(train_data)
         Fv = F[valid]
         vixv = vix[valid]
@@ -642,12 +736,22 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3):
         vz = (vixv - vix_mean) / vix_std
         Xc = np.column_stack([np.ones_like(vz), vz])
 
-        if state["last_fit"] is None:
-            fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, n_restarts=n_restarts_cold)
+        if transitions == "nh":
+            if state["last_fit"] is None:
+                fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, n_restarts=n_restarts_cold)
+            else:
+                fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, init=state["last_fit"])
+        elif transitions == "homog":
+            if state["last_fit"] is None:
+                fit = fit_homog_mvn_with_restarts(Xz, K=K, n_restarts=n_restarts_cold)
+            else:
+                fit = fit_homog_mvn_with_restarts(Xz, K=K, init=state["last_fit"])
         else:
-            fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, init=state["last_fit"])
+            raise ValueError(f"unknown transitions={transitions!r}")
+
         state["last_fit"] = fit
-        return ProposalModel(fit, feat_mean, feat_std, vix_mean, vix_std, K)
+        return ProposalModel(fit, feat_mean, feat_std, vix_mean, vix_std, K,
+                             feature_fn=feature_fn, order_channel=order_channel)
 
     return factory
 
@@ -693,10 +797,48 @@ def run_exp_002_proposal_k3() -> None:
     )
 
 
+def run_exp_003_multivariate_only() -> None:
+    """Ablation: K=3 full-Sigma MVN on (rₜ, σₜ^{5d}, dₜ_{200}) with HOMOGENEOUS
+    transitions. Isolates whether the multivariate observation alone helps,
+    holding the transition structure fixed at the baseline's homogeneous form."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3,
+                                    feature_fn=trivariate_features,
+                                    transitions="homog", order_channel=0)
+    harness.evaluate(
+        experiment_id="exp_003_multivariate_only",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_full",
+        transitions="homogeneous",
+        comment="Ablation: multivariate obs alone (trivar MVN, homogeneous A). Isolates the observation channel.",
+    )
+
+
+def run_exp_004_nh_only() -> None:
+    """Ablation: K=3 Gaussian on the baseline's univariate rolling-200 drawdown,
+    but with NH-HMM softmax(VIX) transitions. Isolates whether the
+    non-homogeneous transitions alone help, holding the observation at the
+    baseline's single drawdown channel."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3,
+                                    feature_fn=drawdown_only_features,
+                                    transitions="nh", order_channel=0)
+    harness.evaluate(
+        experiment_id="exp_004_nh_only",
+        model_factory=factory,
+        observation="drawdown_200",
+        K=3,
+        emission="gaussian",
+        transitions="nh_softmax_vix",
+        comment="Ablation: NH transitions alone (drawdown-200 univariate, softmax(VIX) A). Isolates the transition.",
+    )
+
+
 EXPERIMENTS = {
     "exp_001_baseline": run_exp_001_baseline,
     "exp_002_proposal_k3": run_exp_002_proposal_k3,
-    # exp_003 / exp_004 added in Phase 2 based on Phase 1 outcome
+    "exp_003_multivariate_only": run_exp_003_multivariate_only,
+    "exp_004_nh_only": run_exp_004_nh_only,
 }
 
 
