@@ -777,6 +777,77 @@ def fit_homog_mvt_with_restarts(X, K, n_restarts=3, seed=20260603,
 
 
 # ---------------------------------------------------------------------------
+# NH-MVT Baum-Welch (exp_006: Student-t emissions + softmax-VIX transitions)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NHMVTFit:
+    log_pi: np.ndarray
+    W: np.ndarray               # (K, K, Dc) softmax transition weights
+    mu: np.ndarray
+    Sigma: np.ndarray           # scale matrices
+    nu: np.ndarray              # (K,) per-state dof
+    log_likelihood: float
+    n_iter: int
+    converged: bool
+    family: str = "mvt_nh"
+
+
+def baum_welch_nh_mvt(X, Xc, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
+                      trans_maxiter=50, nu_init: float = 8.0,
+                      init: Optional["NHMVTFit"] = None):
+    """EM for a K-state multivariate Student-t NH-HMM (fat-tailed emissions +
+    softmax-VIX transitions). Combines the exp_002 transition body with the
+    exp_005 emission body."""
+    Dc = Xc.shape[1]
+    if init is not None:
+        mu = init.mu.copy(); Sigma = init.Sigma.copy()
+        log_pi = init.log_pi.copy(); W = init.W.copy(); nu = init.nu.copy()
+    else:
+        assert rng is not None, "rng required for cold-start init"
+        mu, Sigma, pi = kmeans_init_mvn(X, K, rng, jitter=jitter)
+        log_pi = np.log(pi + 1e-12)
+        A0 = np.full((K, K), 0.05 / (K - 1)); np.fill_diagonal(A0, 0.95)
+        W = _sticky_W_init(A0, Dc)
+        nu = np.full(K, float(nu_init))
+
+    prev_ll = -np.inf
+    converged = False
+    it = 0
+    for it in range(max_iter):
+        log_B = mvt_log_emissions(X, mu, Sigma, nu)
+        log_A_seq = nh_log_A_seq(W, Xc)
+        log_gamma, log_xi, ll = forward_backward_nh(log_pi, log_A_seq, log_B)
+        log_pi = log_gamma[0] - logsumexp(log_gamma[0])
+        W = nh_transition_mstep(log_xi, Xc, W, maxiter=trans_maxiter)
+        mu, Sigma, nu = m_step_mvt(X, log_gamma, mu, Sigma, nu)
+        if np.isfinite(ll) and abs(ll - prev_ll) < tol:
+            converged = True
+            it += 1
+            break
+        prev_ll = ll
+    return NHMVTFit(log_pi, W, mu, Sigma, nu, ll, it, converged)
+
+
+def fit_nh_mvt_with_restarts(X, Xc, K, n_restarts=3, seed=20260603,
+                             init: Optional["NHMVTFit"] = None):
+    if init is not None:
+        return baum_welch_nh_mvt(X, Xc, K, init=init, max_iter=40)
+    best = None
+    master = np.random.default_rng(seed)
+    for r in range(n_restarts):
+        rng = np.random.default_rng(master.integers(1 << 31))
+        jitter = 0.0 if r == 0 else 0.25
+        fit = baum_welch_nh_mvt(X, Xc, K, rng=rng, jitter=jitter)
+        if best is None or (np.isfinite(fit.log_likelihood) and
+                            fit.log_likelihood > best.log_likelihood):
+            best = fit
+    if best is None:
+        raise RuntimeError("all NH-MVT restarts failed")
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Proposal model — MVN/MVT emissions + (NH or homogeneous) transitions, filtering
 # ---------------------------------------------------------------------------
 
@@ -864,15 +935,10 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
     jittered restarts on the first call, warm-start single-EM thereafter (the
     walk-forward tractability trick from the baseline, carried over here).
 
-    `transitions` selects 'nh' (softmax-VIX, exp_002/exp_004) or 'homog'
+    `transitions` selects 'nh' (softmax-VIX, exp_002/exp_004/exp_006) or 'homog'
     (closed-form, exp_003/exp_005). `emission` selects 'mvn' (Gaussian) or 'mvt'
-    (Student-t, exp_005). `feature_fn` selects the observation channels
-    (trivariate by default; drawdown-only for exp_004).
-
-    Note: 'mvt' is only wired for homogeneous transitions (the Student-t ECM
-    M-step + softmax-transition optimise are not combined in this iteration)."""
-    if emission == "mvt" and transitions != "homog":
-        raise NotImplementedError("mvt emission is only wired for homogeneous transitions")
+    (Student-t, exp_005/exp_006). `feature_fn` selects the observation channels
+    (trivariate by default; drawdown-only for exp_004)."""
     if feature_fn is None:
         feature_fn = trivariate_features
     state = {"last_fit": None}
@@ -895,10 +961,11 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
         Xc = np.column_stack([np.ones_like(vz), vz])
 
         if transitions == "nh":
+            fit_fn = fit_nh_mvt_with_restarts if emission == "mvt" else fit_nh_mvn_with_restarts
             if state["last_fit"] is None:
-                fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, n_restarts=n_restarts_cold)
+                fit = fit_fn(Xz, Xc, K=K, n_restarts=n_restarts_cold)
             else:
-                fit = fit_nh_mvn_with_restarts(Xz, Xc, K=K, init=state["last_fit"])
+                fit = fit_fn(Xz, Xc, K=K, init=state["last_fit"])
         elif transitions == "homog":
             if emission == "mvt":
                 fit_fn = fit_homog_mvt_with_restarts
@@ -1021,12 +1088,37 @@ def run_exp_005_mvt_homog() -> None:
     )
 
 
+def run_exp_006_mvt_nh() -> None:
+    """Phase 3 capstone: K=3 multivariate Student-t (full Σ, per-state ν) on
+    (rₜ, σₜ^{5d}, dₜ_{200}) with NH-HMM softmax(VIX) transitions.
+
+    Combines the only COVID-cracker (NH-VIX, exp_002 → 0.207) with the
+    smoothness/confidence of fat tails (exp_005 → flips halved, 2022/2024
+    maxed). Tests the central tension: can the exogenous-VIX transition lift
+    COVID while the fat-tailed emission rescues the calm-VIX 2024 bull that the
+    NH transition collapsed under Gaussian (exp_002 → 0.083)?"""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3,
+                                    feature_fn=trivariate_features,
+                                    transitions="nh", emission="mvt",
+                                    order_channel=0)
+    harness.evaluate(
+        experiment_id="exp_006_mvt_nh",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvt_full",
+        transitions="nh_softmax_vix",
+        comment="Phase3 capstone: K=3 multivariate Student-t + NH-HMM softmax(VIX). COVID-cracker x fat-tail smoothness.",
+    )
+
+
 EXPERIMENTS = {
     "exp_001_baseline": run_exp_001_baseline,
     "exp_002_proposal_k3": run_exp_002_proposal_k3,
     "exp_003_multivariate_only": run_exp_003_multivariate_only,
     "exp_004_nh_only": run_exp_004_nh_only,
     "exp_005_mvt_homog": run_exp_005_mvt_homog,
+    "exp_006_mvt_nh": run_exp_006_mvt_nh,
 }
 
 
