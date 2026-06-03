@@ -1,24 +1,27 @@
 """Fetch BTCUSDT daily candles from Binance into data/btcusdt_daily.csv.
 
-Autoresearch iteration 2 window: 2017-08-17 → 2025-12-31. Covers all
-five consensus regime periods (2018 bear, 2020-Q1 COVID, 2020-Q2 →
-2021-Q4 bull, 2022 bear, 2024 post-ETF bull) plus the rolling-200-day
-drawdown warm-up.
+The fetch window is parametric. Defaults cover the full dashboard range
+(2017-08-17 → present); pass --start / --end to override. Binance caps a
+single klines response at 1000 candles, so we page with a startTime cursor.
+
+    python data/fetch_btcusdt_daily.py                       # full range
+    python data/fetch_btcusdt_daily.py --start 2021-06-01 --end 2023-06-30
 """
 
+import argparse
 import os
 import sys
 import time
-import requests
+
 import pandas as pd
+import requests
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 SYMBOL = "BTCUSDT"
 INTERVAL = "1d"
 
-# Iteration-2 window: 2017-08-17 (BTCUSDT launch on Binance) → 2025-12-31.
-START_MS = int(pd.Timestamp("2017-08-17", tz="UTC").timestamp() * 1000)
-END_MS = int(pd.Timestamp("2025-12-31", tz="UTC").timestamp() * 1000)
+# Full dashboard range. BTCUSDT spot on Binance starts 2017-08-17.
+DEFAULT_START = "2017-08-17"
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "btcusdt_daily.csv")
 
@@ -30,7 +33,7 @@ KLINE_COLUMNS = [
 
 
 def fetch_klines(start_ms: int, end_ms: int) -> pd.DataFrame:
-    """Page through klines 1000 at a time until we cover the window."""
+    """Page through klines 1000 at a time until we cover [start_ms, end_ms]."""
     rows = []
     cursor = start_ms
     while cursor <= end_ms:
@@ -62,20 +65,36 @@ def fetch_klines(start_ms: int, end_ms: int) -> pd.DataFrame:
     df["open_time"] = df["open_time"].astype("int64")
     df["close_time"] = df["close_time"].astype("int64")
     df["date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.date
+    # de-dup on date (cursor overlap can repeat a boundary candle)
+    df = df.drop_duplicates(subset="date").sort_values("date").reset_index(drop=True)
     return df[["date", "open_time", "open", "high", "low", "close", "volume"]]
 
 
-def main():
-    print(f"Fetching {SYMBOL} {INTERVAL} candles "
-          f"{pd.Timestamp(START_MS, unit='ms', tz='UTC').date()} → "
-          f"{pd.Timestamp(END_MS, unit='ms', tz='UTC').date()}")
-    df = fetch_klines(START_MS, END_MS)
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Fetch BTCUSDT daily candles from Binance.")
+    p.add_argument("--start", default=DEFAULT_START,
+                   help=f"UTC start date YYYY-MM-DD (default {DEFAULT_START})")
+    p.add_argument("--end", default=None,
+                   help="UTC end date YYYY-MM-DD (default: today)")
+    p.add_argument("--out", default=OUT_PATH, help="output CSV path")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    start_ts = pd.Timestamp(args.start, tz="UTC")
+    end_ts = (pd.Timestamp(args.end, tz="UTC") if args.end
+              else pd.Timestamp.now(tz="UTC").normalize())
+    start_ms = int(start_ts.timestamp() * 1000)
+    end_ms = int(end_ts.timestamp() * 1000)
+
+    print(f"Fetching {SYMBOL} {INTERVAL} candles {start_ts.date()} → {end_ts.date()}")
+    df = fetch_klines(start_ms, end_ms)
     print(f"  got {len(df)} candles, {df['date'].min()} → {df['date'].max()}")
-    expected = (pd.Timestamp(END_MS, unit="ms", tz="UTC")
-                - pd.Timestamp(START_MS, unit="ms", tz="UTC")).days + 1
+    expected = (end_ts - start_ts).days + 1
     print(f"  expected ~{expected} daily candles, gap = {expected - len(df)}")
-    df.to_csv(OUT_PATH, index=False)
-    print(f"  wrote {OUT_PATH}")
+    df.to_csv(args.out, index=False)
+    print(f"  wrote {args.out}")
 
 
 if __name__ == "__main__":
