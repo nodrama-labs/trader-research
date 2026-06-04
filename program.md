@@ -87,7 +87,7 @@ Hard rejection (`-inf`) on either:
   floor).
 - More than 10 % of causal walk-forward windows fail to converge.
 
-A candidate beats the current best iff its `regime_score` is strictly
+A candidate beats the current best if its `regime_score` is strictly
 higher.
 
 ## Discipline locked into `harness.py` (not sweep-able)
