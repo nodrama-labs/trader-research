@@ -160,9 +160,38 @@ If `exp_002` does NOT beat `exp_001`: *ablation branch*:
 **Phase 3** — your call. Based on Phase 2 results, propose 1-3 follow-up
 experiments that close remaining ambiguities, or move toward Student-t
 emissions (paper 3) / semi-Markov sojourn (paper 4) variants if the
-mass of evidence suggests they're worth trying. Stop when (a) a winner
-has been established AND its dominant components have been ablated, or
-(b) the human interrupts.
+mass of evidence suggests they're worth trying. You may also draw from
+the **hypothesis pool** below. Stop when (a) a winner has been
+established AND its dominant components have been ablated, or (b) the
+human interrupts.
+
+### Hypothesis pool (the loop may draw from these)
+
+Open directions, not yet on the ladder. Promote one into a named
+experiment when the evidence suggests it's worth a walk-forward.
+
+- **State→label projection stability.** The K-state→{bear,ranging,bull}
+  map is currently a hard `argsort(μ)` on one channel (`sweep.py`
+  `BaselineModel`/`ProposalModel`). When two states' means cross — between
+  refits, or between two nearby architectures — the posterior columns
+  relabel and `regime_score` jumps for reasons unrelated to model
+  quality. The harness score is smooth *given* posteriors; this is the
+  one remaining seam, in the (mutable) modeling layer. Most fragile for
+  K≥4 (thirds-bucketing) and the multivariate proposal (states close on
+  the return channel). Candidate variants to try and score like any
+  other experiment:
+  - *identity-pin*: compute the state→label map once at cold-start and
+    reuse it for all warm-started refits (warm-start preserves state
+    identity, so the map stays stable). Semantics: labels track state
+    *identity* rather than current μ-rank.
+  - *anchored cutpoints*: assign by absolute μ thresholds on the order
+    channel instead of rank (no rank-flips; risks empty buckets).
+  - *cross-refit matching*: Hungarian/greedy match each refit's states to
+    the previous refit's labels for within-experiment stability.
+  Success criterion: improves (or doesn't distort) `regime_score` while
+  reducing run-to-run / neighbour-architecture score variance. Underlying
+  semantic choice — identity vs. μ-rank — is itself part of the
+  hypothesis.
 
 ## TSV row schema
 
