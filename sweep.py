@@ -911,7 +911,8 @@ class ProposalModel:
     """
 
     def __init__(self, fit, feat_mean, feat_std, vix_mean, vix_std, K,
-                 feature_fn=None, order_channel: int = 0, vix_transform: str = "linear"):
+                 feature_fn=None, order_channel: int = 0, vix_transform: str = "linear",
+                 state_to_col=None):
         self.fit = fit
         self.feat_mean = feat_mean
         self.feat_std = feat_std
@@ -922,6 +923,14 @@ class ProposalModel:
         self.feature_fn = feature_fn if feature_fn is not None else trivariate_features
         self.is_nh = hasattr(fit, "W")                 # NH fit carries softmax W
         self.is_mvt = hasattr(fit, "nu")               # Student-t fit carries dof
+        if state_to_col is not None:
+            # Identity-pinned map supplied by the factory: computed once at
+            # cold-start and reused across warm-started refits (which preserve
+            # state identity). Bypasses the per-fit μ-rank, which can swap columns
+            # when two states' means cross between refits — a bear<->bull swap is a
+            # BRIER_OPP=8 catastrophe, not just a spurious flip (BACKLOG BL-001).
+            self.state_to_col = np.asarray(state_to_col, dtype=int)
+            return
         order = np.argsort(fit.mu[:, order_channel])   # by return (or drawdown) channel
         # Map each state -> canonical column. For K=3: order[0]=bear, [1]=ranging,
         # [2]=bull. For K>3, first third -> bear, last third -> bull, middle -> ranging.
@@ -979,7 +988,8 @@ class ProposalModel:
 def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
                           feature_fn=None, transitions: str = "nh",
                           emission: str = "mvn", order_channel: int = 0,
-                          cov_type: str = "full", vix_transform: str = "linear"):
+                          cov_type: str = "full", vix_transform: str = "linear",
+                          pin_labels: bool = False):
     """Stateful factory for the MVN/MVT proposal family: cold-start k-means +
     jittered restarts on the first call, warm-start single-EM thereafter (the
     walk-forward tractability trick from the baseline, carried over here).
@@ -995,7 +1005,8 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
     diag = (cov_type == "diag")
     if diag and emission == "mvt":
         raise ValueError("cov_type='diag' is only implemented for the Gaussian (mvn) emission")
-    state = {"last_fit": None}
+    # `pinned_col` caches the cold-start state->label map for identity-pinning.
+    state = {"last_fit": None, "pinned_col": None}
 
     def factory(train_data: pd.DataFrame) -> ProposalModel:
         F, valid = feature_fn(train_data)
@@ -1036,9 +1047,15 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
             raise ValueError(f"unknown transitions={transitions!r}")
 
         state["last_fit"] = fit
-        return ProposalModel(fit, feat_mean, feat_std, vix_mean, vix_std, K,
-                             feature_fn=feature_fn, order_channel=order_channel,
-                             vix_transform=vix_transform)
+        model = ProposalModel(fit, feat_mean, feat_std, vix_mean, vix_std, K,
+                              feature_fn=feature_fn, order_channel=order_channel,
+                              vix_transform=vix_transform,
+                              state_to_col=(state["pinned_col"] if pin_labels else None))
+        if pin_labels and state["pinned_col"] is None:
+            # Capture the cold-start map; every subsequent warm-started refit
+            # reuses it (state identity is preserved across warm starts).
+            state["pinned_col"] = model.state_to_col
+        return model
 
     return factory
 
@@ -1204,6 +1221,30 @@ def run_exp_008_diag_vixgate() -> None:
     )
 
 
+def run_exp_009_diag_pinned() -> None:
+    """Phase-3 (responds to BACKLOG BL-001's caveat): exp_004 (K=3 diagonal-Σ MVN +
+    NH-softmax(VIX), return-sort) but with the state→label map IDENTITY-PINNED —
+    computed once at cold-start and reused across all warm-started refits.
+
+    Warm-start preserves state identity, so the cold-start map stays valid; pinning
+    removes cross-refit column swaps that happen when two states' return-means cross
+    between refits. Such a swap is not merely a spurious flip_count tick: a
+    bear↔bull column swap dumps mass on the opposite extreme (BRIER_OPP=8), so
+    pinning can lift regime_score AND clean the diagnostic flip_count. exp_007 showed
+    drawdown-sort hurts 2018, so the pinned map uses the return axis (exp_004's)."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3, cov_type="diag",
+                                    pin_labels=True)
+    harness.evaluate(
+        experiment_id="exp_009_diag_pinned",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_diag",
+        transitions="nh_softmax_vix",
+        comment="Phase3 (BL-001): exp_004 + identity-pinned state->label map (cold-start, reused on warm refits). Kills refit column swaps.",
+    )
+
+
 def run_exp_005_mvt_homog() -> None:
     """Phase 3: K=3 multivariate Student-t (full scale Σ, per-state dof ν) on
     (rₜ, σₜ^{5d}, dₜ_{200}) with homogeneous transitions.
@@ -1268,6 +1309,7 @@ EXPERIMENTS = {
     # Phase-3 (this run's call): build on the diagonal-Σ winner (exp_004).
     "exp_007_diag_ddsort": run_exp_007_diag_ddsort,
     "exp_008_diag_vixgate": run_exp_008_diag_vixgate,
+    "exp_009_diag_pinned": run_exp_009_diag_pinned,
 }
 
 
