@@ -68,27 +68,43 @@ do not need to read them; they're preserved as historical record.
 
 ## Scoring rule
 
-`regime_score` from `harness.py`:
+`regime_score` from `harness.py` — a smooth, severity-weighted Brier
+score, **`regime_score = Q · R`**:
 
 ```
-regime_score = mean over labelled periods P of:
-                   mean over days d in P of: posterior[d, true_label(P)]
+s_P = 1 − mean over days d in P of:  L_d / (BRIER_HIT + BRIER_OPP)
+L_d = BRIER_HIT     · (1 − posterior[d, correct] )²
+    + BRIER_RANGING ·      posterior[d, ranging]  ²
+    + BRIER_OPP     ·      posterior[d, opposite] ²
+Q   = ( Π over the five consensus periods P of s_P )^(1/5)   # geometric mean
+R   = exp( −NONCONV_LAMBDA · nonconvergence_rate )
 ```
 
-Range [0, 1], higher is better. Macro-average over the **five
-consensus periods** (2018 bear, 2020-Q1 COVID, 2020-Q2→2021-Q4 bull,
-2022 bear, 2024 post-ETF bull) means a long period doesn't dominate a
-short one.
+Range [0, 1], higher is better. The per-day loss weights each label
+class by its **role** relative to the period's true label: the correct
+class (`BRIER_HIT = 1`), the cautious middle ranging
+(`BRIER_RANGING = 0.25`), and the opposite extreme — the catastrophe,
+e.g. bull-mass during a bear (`BRIER_OPP = 8`). The two terms in tension
+(hit vs. catastrophe) reward confident-correct calls, punish
+confident-wrong-direction calls, and forgive caution.
 
-Hard rejection (`-inf`) on either:
+The macro-average is a **geometric mean** over the **five consensus
+periods** (2018 bear, 2020-Q1 COVID, 2020-Q2→2021-Q4 bull, 2022 bear,
+2024 post-ETF bull) — a soft minimum, so one blind regime drags the
+score down hard but smoothly: every regime must be caught. The
+reliability factor `R` folds non-convergence in smoothly
+(`NONCONV_LAMBDA = 7` → 10 % failures roughly halve the score).
 
-- Any labelled period scores below **0.40** mean posterior on its true
-  label (the "doesn't even argmax to the right regime, on average"
-  floor).
-- More than 10 % of causal walk-forward windows fail to converge.
+**No hard rejections, no `-inf`.** The statistic is finite and smooth
+everywhere, so the selection loop always has a ranking gradient. NaN /
+numerically-failed posteriors are scored as the uniform "don't know"
+distribution, not dropped (so a model cannot inflate its score by
+failing on hard days).
 
 A candidate beats the current best if its `regime_score` is strictly
-higher.
+higher. **Scores under this rule are NOT comparable to pre-2026-06-14
+TSV rows** — re-score `exp_001_baseline` under the new statistic before
+comparing.
 
 ## Discipline locked into `harness.py` (not sweep-able)
 

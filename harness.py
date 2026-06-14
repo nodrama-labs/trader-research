@@ -3,8 +3,9 @@
 Responsibilities (per program.md):
 
 - Load BTC daily candles, VIX daily, consensus regime labels.
-- Compute the canonical `regime_score` (macro-average mean posterior of the
-  correct label across the 5 consensus periods).
+- Compute the canonical `regime_score` (smooth severity-weighted Brier
+  `Q · R` over the 5 consensus periods; see
+  docs/plans/2026-06-14-regime-score-fit-statistic-design.md).
 - Drive a causal walk-forward evaluation: fit the model on `[0..t-1]`, score
   posterior at `t`, slide forward with a refit cadence.
 - Append a single TSV row per `evaluate()` call with the canonical schema.
@@ -57,9 +58,21 @@ WARMUP_DAYS = 200
 # comparisons honest.
 REFIT_CADENCE_DAYS = 30
 
-# Hard-rejection thresholds (mirror program.md §"Scoring rule"):
-PER_PERIOD_FLOOR = 0.40
-MAX_NONCONVERGENCE_RATE = 0.10
+# Severity-weighted Brier role weights (mirror program.md §"Scoring rule").
+# Each scored day's loss weights the three label classes by their ROLE relative
+# to the period's true label: the correct class, the cautious middle (ranging),
+# and the opposite extreme (the catastrophe — e.g. bull-mass during a bear).
+# Not sweep-able: the loop must not be able to soften its own penalty.
+BRIER_HIT = 1.0        # weight on the CORRECT class (calibration / "hit" term)
+BRIER_RANGING = 0.25   # weight on RANGING (abstention costs a little, not a lot)
+BRIER_OPP = 8.0        # weight on the OPPOSITE extreme (catastrophe / mislabel);
+                       # a half-mass wrong-way bet then scores ~1.8x worse than
+                       # staying flat (all-ranging).
+
+# Reliability decay. The score is multiplied by exp(-NONCONV_LAMBDA * rate);
+# 7.0 makes a 10% non-convergence rate ~halve the score (exp(-0.7) ≈ 0.50),
+# replacing the old >10% -> -inf cliff with a smooth penalty.
+NONCONV_LAMBDA = 7.0
 
 # The five consensus periods named in the grant proposal (§4.1). Macro-average
 # over these — and ONLY these — defines `regime_score`. The four ranging windows
@@ -79,6 +92,10 @@ CONSENSUS_PERIODS = (
 # K=4+).
 LABEL_VALUES = ("bear", "ranging", "bull")
 LABEL_TO_IDX = {lab: i for i, lab in enumerate(LABEL_VALUES)}
+
+# The "opposite extreme" of each directional label — the catastrophic confusion
+# the Brier `BRIER_OPP` term punishes. Ranging has no opposite (it is the middle).
+OPPOSITE_LABEL = {"bear": "bull", "bull": "bear"}
 
 
 # ---------------------------------------------------------------------------
@@ -316,78 +333,99 @@ def causal_walk_forward(
 
 @dataclass
 class ScoreReport:
-    regime_score: float                 # macro-avg of the 5 consensus periods
-    per_period: dict                    # period_id -> mean posterior on correct label
+    regime_score: float                 # Q * R, in [0, 1] (higher is better)
+    quality: float                      # Q: geomean over consensus periods of s_P
+    reliability: float                  # R: exp(-NONCONV_LAMBDA * nonconv_rate)
+    per_period: dict                    # period_id -> s_P (per-period score in [0,1])
     argmax_acc: float                   # over all scored, labelled days
-    n_valid: int                        # rows actually contributing to the score
-    n_dropped_nan: int                  # posterior was NaN
+    n_valid: int                        # rows contributing to the score
+    n_nan_uniform: int                  # NaN posterior rows scored as uniform
     nonconvergence_rate: float
-    hard_rejection: Optional[str]       # reason if -inf, else None
 
 
 def regime_score(result: WalkForwardResult, n_refits_attempted: int = None) -> ScoreReport:
-    """Compute the canonical macro-averaged regime_score from a walk-forward.
+    """Compute the canonical smooth regime_score from a walk-forward.
 
-    Macro-averages over CONSENSUS_PERIODS only (ranging windows are excluded
-    from the score per program.md). Applies the per-period 0.40 floor and
-    >10% non-convergence hard rejections.
+        regime_score = Q * R
+
+        s_P = 1 - mean_t( L_t ) / (BRIER_HIT + BRIER_OPP)   per consensus period
+        L_t = BRIER_HIT     * (1 - p[correct])**2           severity-weighted
+            + BRIER_RANGING *      p[ranging]**2             per-day Brier loss
+            + BRIER_OPP     *      p[opposite]**2
+        Q   = ( Π_P s_P )^(1/N)                              geomean (soft-min)
+        R   = exp(-NONCONV_LAMBDA * nonconvergence_rate)     reliability factor
+
+    Smooth and finite in [0, 1] — no -inf hard rejections. Scores only the five
+    CONSENSUS_PERIODS (ranging windows excluded). NaN / numerically-failed
+    posteriors are scored as the uniform "don't know" distribution rather than
+    dropped, so a model cannot inflate its score by failing on hard days. See
+    docs/plans/2026-06-14-regime-score-fit-statistic-design.md.
     """
-    valid = ~np.any(np.isnan(result.posteriors), axis=1)
-    n_dropped_nan = int((~valid).sum())
+    # NaN posteriors -> uniform (max-entropy), not dropped.
+    posteriors = result.posteriors
+    nan_rows = np.any(np.isnan(posteriors), axis=1)
+    n_nan_uniform = int(nan_rows.sum())
+    if n_nan_uniform:
+        posteriors = posteriors.copy()
+        posteriors[nan_rows] = 1.0 / len(LABEL_VALUES)
+
+    denom = BRIER_HIT + BRIER_OPP  # max possible per-day loss
 
     per_period_scores = {}
+    ranging_idx = LABEL_TO_IDX["ranging"]
     for pid in CONSENSUS_PERIODS:
-        mask = (result.scored_periods == pid) & valid
+        mask = result.scored_periods == pid
         if mask.sum() == 0:
             per_period_scores[pid] = np.nan
             continue
-        label_str = result.scored_labels[mask][0]  # all days in a period share the label
-        label_idx = LABEL_TO_IDX[label_str]
-        per_period_scores[pid] = float(np.mean(result.posteriors[mask, label_idx]))
+        label_str = result.scored_labels[mask][0]  # days in a period share the label
+        correct_idx = LABEL_TO_IDX[label_str]
+        opposite_idx = LABEL_TO_IDX[OPPOSITE_LABEL[label_str]]
+        p = posteriors[mask]
+        loss = (
+            BRIER_HIT * (1.0 - p[:, correct_idx]) ** 2
+            + BRIER_RANGING * p[:, ranging_idx] ** 2
+            + BRIER_OPP * p[:, opposite_idx] ** 2
+        )
+        per_period_scores[pid] = float(1.0 - np.mean(loss) / denom)
 
-    valid_periods = {k: v for k, v in per_period_scores.items() if not np.isnan(v)}
-    if not valid_periods:
-        macro = -np.inf
-        hard_rejection = "no valid consensus periods"
+    # Quality: geometric mean (soft minimum) over the present consensus periods.
+    valid_periods = [v for v in per_period_scores.values() if not np.isnan(v)]
+    if valid_periods:
+        clipped = np.clip(valid_periods, 0.0, 1.0)
+        quality = float(np.prod(clipped) ** (1.0 / len(clipped)))
     else:
-        macro = float(np.mean(list(valid_periods.values())))
-        hard_rejection = None
-        for pid, v in valid_periods.items():
-            if v < PER_PERIOD_FLOOR:
-                hard_rejection = f"{pid} mean posterior {v:.3f} < floor {PER_PERIOD_FLOOR}"
-                macro = -np.inf
-                break
+        quality = 0.0
 
-    # Argmax accuracy (sanity diagnostic, all labelled days):
-    if valid.sum() > 0:
-        argmax_pred = np.argmax(result.posteriors[valid], axis=1)
-        true_idx = np.array([LABEL_TO_IDX[lab] for lab in result.scored_labels[valid]])
+    # Reliability: smooth penalty on the non-convergence rate.
+    if n_refits_attempted is None:
+        n_refits_attempted = result.n_refits + result.n_nonconvergence
+    nonconv_rate = (
+        result.n_nonconvergence / n_refits_attempted if n_refits_attempted > 0 else 0.0
+    )
+    reliability = float(np.exp(-NONCONV_LAMBDA * nonconv_rate))
+
+    regime_sc = quality * reliability
+
+    # Argmax accuracy (sanity diagnostic, all scored days):
+    if len(posteriors) > 0:
+        argmax_pred = np.argmax(posteriors, axis=1)
+        true_idx = np.array([LABEL_TO_IDX[lab] for lab in result.scored_labels])
         argmax_acc = float((argmax_pred == true_idx).mean())
     else:
         argmax_acc = float("nan")
 
-    # Non-convergence rate. We use n_refits as the denominator — the number of
-    # actually-completed fits.
-    if n_refits_attempted is None:
-        n_refits_attempted = result.n_refits + result.n_nonconvergence
-    if n_refits_attempted > 0:
-        nonconv_rate = result.n_nonconvergence / n_refits_attempted
-    else:
-        nonconv_rate = 0.0
-    if nonconv_rate > MAX_NONCONVERGENCE_RATE:
-        hard_rejection = (
-            f"non-convergence rate {nonconv_rate:.1%} > {MAX_NONCONVERGENCE_RATE:.0%}"
-        )
-        macro = -np.inf
+    in_consensus = np.isin(result.scored_periods, np.array(CONSENSUS_PERIODS))
 
     return ScoreReport(
-        regime_score=macro,
+        regime_score=regime_sc,
+        quality=quality,
+        reliability=reliability,
         per_period=per_period_scores,
         argmax_acc=argmax_acc,
-        n_valid=int(valid.sum()),
-        n_dropped_nan=n_dropped_nan,
+        n_valid=int(in_consensus.sum()),
+        n_nan_uniform=n_nan_uniform,
         nonconvergence_rate=nonconv_rate,
-        hard_rejection=hard_rejection,
     )
 
 
@@ -514,11 +552,10 @@ def evaluate(
         comment=comment,
     )
 
-    print(f"\nScore: regime_score={report.regime_score:.4f}  "
+    print(f"\nScore: regime_score={report.regime_score:.4f} "
+          f"(quality={report.quality:.4f} x reliability={report.reliability:.4f})  "
           f"argmax_acc={report.argmax_acc:.4f}  flips={flip_count}")
-    print(f"Per-period: {report.per_period}")
-    if report.hard_rejection:
-        print(f"Hard rejection: {report.hard_rejection}")
+    print(f"Per-period s_P: {report.per_period}")
     print("Done.")
 
     return report
