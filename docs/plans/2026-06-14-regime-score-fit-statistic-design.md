@@ -195,9 +195,19 @@ baseline row that future experiments are compared against.
   *jump across architectures*. This redesign smooths the within-experiment
   landscape; it cannot fully smooth the cross-architecture one. Candidate
   follow-up: soft/rank-based projection — separate effort.
-- **Refit-cadence doc drift.** `program.md:97` says weekly; `harness.py:58` sets
-  monthly (`REFIT_CADENCE_DAYS = 30`). Pre-existing, unrelated to this redesign;
-  reconcile separately.
+- **Refit-cadence doc drift.** ~~`program.md` said weekly; `harness.py` sets
+  monthly (`REFIT_CADENCE_DAYS = 30`).~~ **Resolved 2026-06-14** — `program.md`
+  updated to monthly to match the contract surface.
+
+- **Warmup non-convergence is folded into `R`.** The first 1-2 refits fail with
+  "not enough valid observations" because the `rolling-200` drawdown feature
+  isn't populated at `eval_start = 200`. These count toward `nonconv_rate`, so
+  every drawdown-based experiment carries a constant `R ≈ exp(-7·2/96) ≈ 0.864`
+  factor. **Known caveat, intentionally not fixed:** it is identical across
+  experiments sharing a feature warmup, so it cancels out of all *rankings* (the
+  loop's only concern); it only lowers the absolute score ceiling. The one place
+  it could bias comparison is across feature families with different warmup
+  lengths — revisit only if that arises.
 - **Scoring the ranging windows.** Deferred. Kept the score on the five
   consensus periods only to preserve the `program.md` contract and TSV
   comparability. The Brier form handles `true = ranging` naturally

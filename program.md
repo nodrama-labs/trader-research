@@ -109,10 +109,12 @@ comparing.
 ## Discipline locked into `harness.py` (not sweep-able)
 
 - **Causal walk-forward**: at each evaluation day t, the HMM is fit on
-  `[0..t-1]` and scores posterior at `t`. Refit cadence is **weekly**
-  (every 7 days) — paper 2's "30-60 day single-regime persistence"
-  finding makes weekly refit a sensible default. Posteriors between
-  refits use the most recent fit's parameters applied forward.
+  `[0..t-1]` and scores posterior at `t`. Refit cadence is **monthly**
+  (every 30 days, `REFIT_CADENCE_DAYS` in `harness.py`) — paper 2's
+  "30-60 day single-regime persistence" finding puts monthly at the low
+  end of that range, giving the fit room to absorb regime shifts at a
+  ~10x compute saving over weekly. Posteriors between refits use the
+  most recent fit's parameters applied forward.
 - **Baseline**: established by `exp_001_baseline` (K=3 Gaussian on
   rolling-200-day drawdown, homogeneous transitions). Every subsequent
   experiment is compared against this row in the TSV.
