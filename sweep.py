@@ -107,6 +107,30 @@ def vix_covariate(data: pd.DataFrame) -> np.ndarray:
     return vix
 
 
+def vix_design(vz: np.ndarray, transform: str = "linear") -> np.ndarray:
+    """Build the NH transition design matrix Xc = (1, f(vix_std_t)) from already-
+    standardized VIX `vz`.
+
+    transform='linear' -> f = identity: the always-on softmax slope of exp_002/004,
+        where even below-average VIX linearly shifts the transition probabilities.
+    transform='relu'   -> f = max(0, vz): a one-sided gate. Below-average-VIX (calm)
+        days collapse to f=0, so the transition falls back to the homogeneous
+        softmax *intercept* (the sticky baseline); only elevated VIX shifts the
+        transitions. This is the prior report's recommended fix for the NH
+        transition's calm-VIX damage to the bull periods — keep COVID's VIX-driven
+        bear switch without routing calm 2020-21 / 2024 bull days to ranging.
+        The gate threshold is pinned (hyperparameter-free) at the training-window
+        VIX mean, since vz is standardized causally per refit.
+    """
+    if transform == "linear":
+        feat = vz
+    elif transform == "relu":
+        feat = np.maximum(vz, 0.0)
+    else:
+        raise ValueError(f"unknown vix transform {transform!r}")
+    return np.column_stack([np.ones_like(feat), feat])
+
+
 # ---------------------------------------------------------------------------
 # HMM core — log-space forward / forward-backward / Viterbi
 # ---------------------------------------------------------------------------
@@ -887,13 +911,14 @@ class ProposalModel:
     """
 
     def __init__(self, fit, feat_mean, feat_std, vix_mean, vix_std, K,
-                 feature_fn=None, order_channel: int = 0):
+                 feature_fn=None, order_channel: int = 0, vix_transform: str = "linear"):
         self.fit = fit
         self.feat_mean = feat_mean
         self.feat_std = feat_std
         self.vix_mean = vix_mean
         self.vix_std = vix_std
         self.K = K
+        self.vix_transform = vix_transform
         self.feature_fn = feature_fn if feature_fn is not None else trivariate_features
         self.is_nh = hasattr(fit, "W")                 # NH fit carries softmax W
         self.is_mvt = hasattr(fit, "nu")               # Student-t fit carries dof
@@ -920,7 +945,7 @@ class ProposalModel:
     def _standardize(self, F, vix):
         Xz = (F - self.feat_mean[None, :]) / self.feat_std[None, :]
         vz = (vix - self.vix_mean) / self.vix_std
-        Xc = np.column_stack([np.ones_like(vz), vz])
+        Xc = vix_design(vz, self.vix_transform)
         return Xz, Xc
 
     def forward_posterior(self, data: pd.DataFrame) -> np.ndarray:
@@ -954,7 +979,7 @@ class ProposalModel:
 def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
                           feature_fn=None, transitions: str = "nh",
                           emission: str = "mvn", order_channel: int = 0,
-                          cov_type: str = "full"):
+                          cov_type: str = "full", vix_transform: str = "linear"):
     """Stateful factory for the MVN/MVT proposal family: cold-start k-means +
     jittered restarts on the first call, warm-start single-EM thereafter (the
     walk-forward tractability trick from the baseline, carried over here).
@@ -987,7 +1012,7 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
 
         Xz = (Fv - feat_mean[None, :]) / feat_std[None, :]
         vz = (vixv - vix_mean) / vix_std
-        Xc = np.column_stack([np.ones_like(vz), vz])
+        Xc = vix_design(vz, vix_transform)
 
         if transitions == "nh":
             if emission == "mvt":
@@ -1012,7 +1037,8 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
 
         state["last_fit"] = fit
         return ProposalModel(fit, feat_mean, feat_std, vix_mean, vix_std, K,
-                             feature_fn=feature_fn, order_channel=order_channel)
+                             feature_fn=feature_fn, order_channel=order_channel,
+                             vix_transform=vix_transform)
 
     return factory
 
@@ -1132,6 +1158,52 @@ def run_exp_004_nh_only() -> None:
     )
 
 
+def run_exp_007_diag_ddsort() -> None:
+    """Phase-3: exp_004 (K=3 diagonal-Σ MVN + NH-softmax(VIX)) but label states by
+    the DRAWDOWN channel (order_channel=2) instead of the return channel.
+
+    Prior-report finding 6: the regimes separate on drawdown depth + volatility,
+    not daily return, so the return-sort labelling rests on a weak axis. exp_004
+    scores *below* a uniform 'don't know' on 2018-bear days — catastrophic bull-mass
+    leaking onto bear days — consistent with occasional return-sort mislabelling
+    (which the BRIER_OPP=8 penalty punishes hard). Drawdown-sort pins the bear label
+    to the deep-drawdown state directly; targets the now-lowest period (2018)."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3, cov_type="diag",
+                                    order_channel=2)
+    harness.evaluate(
+        experiment_id="exp_007_diag_ddsort",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_diag",
+        transitions="nh_softmax_vix",
+        comment="Phase3: exp_004 + drawdown-sort labels (order_channel=2). Pin bear to deep-drawdown state; targets 2018.",
+    )
+
+
+def run_exp_008_diag_vixgate() -> None:
+    """Phase-3: exp_004 (K=3 diagonal-Σ MVN + NH-softmax(VIX)) but with a one-sided
+    relu(VIX) transition gate instead of the linear softmax slope.
+
+    exp_002's full-Σ NH transition routed calm-VIX bull days to ranging (bull20 +
+    2024 cost); diagonal Σ already recovered most of that, but the linear slope still
+    lets below-average VIX shift transitions. relu(vix_std) collapses calm days to
+    the homogeneous sticky intercept and lets only elevated VIX drive the bear
+    switch — aiming to lift COVID/bull20 without disturbing the recovered 2024 bull.
+    Single-variable change from exp_004 (transition design only; return-sort kept)."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3, cov_type="diag",
+                                    vix_transform="relu")
+    harness.evaluate(
+        experiment_id="exp_008_diag_vixgate",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_diag",
+        transitions="nh_softmax_relu_vix",
+        comment="Phase3: exp_004 + one-sided relu(VIX) transition gate. Calm days revert to sticky intercept; targets COVID/bull20.",
+    )
+
+
 def run_exp_005_mvt_homog() -> None:
     """Phase 3: K=3 multivariate Student-t (full scale Σ, per-state dof ν) on
     (rₜ, σₜ^{5d}, dₜ_{200}) with homogeneous transitions.
@@ -1193,6 +1265,9 @@ EXPERIMENTS = {
     "exp_004_nh_only": run_exp_004_nh_only,
     "exp_005_mvt_homog": run_exp_005_mvt_homog,
     "exp_006_mvt_nh": run_exp_006_mvt_nh,
+    # Phase-3 (this run's call): build on the diagonal-Σ winner (exp_004).
+    "exp_007_diag_ddsort": run_exp_007_diag_ddsort,
+    "exp_008_diag_vixgate": run_exp_008_diag_vixgate,
 }
 
 
