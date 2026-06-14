@@ -356,8 +356,15 @@ def mvn_log_emissions(X: np.ndarray, mu: np.ndarray, Sigma: np.ndarray) -> np.nd
     return log_B
 
 
-def m_step_mvn(X: np.ndarray, log_gamma: np.ndarray, reg: float = 1e-4):
-    """Weighted MLE for K full-covariance Gaussians. Returns (mu, Sigma)."""
+def m_step_mvn(X: np.ndarray, log_gamma: np.ndarray, reg: float = 1e-4,
+               diag: bool = False):
+    """Weighted MLE for K Gaussians. Returns (mu, Sigma).
+
+    diag=False -> full covariance; diag=True -> diagonal covariance (off-diagonal
+    entries zeroed before the ridge). The diagonal path backs exp_004_diag_sigma,
+    which ablates whether the full Σ's cross-channel terms earn their keep on top
+    of the proposal's NH-transition win.
+    """
     gamma = np.exp(log_gamma)                          # (T, K)
     Nk = gamma.sum(axis=0) + 1e-12                     # (K,)
     mu = (gamma.T @ X) / Nk[:, None]                   # (K, D)
@@ -368,8 +375,17 @@ def m_step_mvn(X: np.ndarray, log_gamma: np.ndarray, reg: float = 1e-4):
     for k in range(K):
         diff = X - mu[k]                               # (T, D)
         S = (gamma[:, k:k + 1] * diff).T @ diff / Nk[k]
+        if diag:
+            S = np.diag(np.diag(S))                    # drop cross-channel covariance
         Sigma[k] = S + reg * eye                       # ridge for conditioning
     return mu, Sigma
+
+
+def _diagonalize_cov(Sigma: np.ndarray) -> np.ndarray:
+    """Zero the off-diagonal blocks of every (D, D) covariance in a (K, D, D)
+    stack — used to project a (possibly full) init covariance onto the diagonal
+    family before EM for the diagonal-Σ ablation."""
+    return np.stack([np.diag(np.diag(s)) for s in Sigma])
 
 
 # ---------------------------------------------------------------------------
@@ -506,8 +522,10 @@ def kmeans_init_mvn(X, K, rng, jitter=0.0):
 
 
 def baum_welch_nh_mvn(X, Xc, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
-                      trans_maxiter=50, init: Optional["NHMVNFit"] = None):
-    """EM for a K-state multivariate-Gaussian NH-HMM. Warm-start from `init`."""
+                      trans_maxiter=50, init: Optional["NHMVNFit"] = None,
+                      diag: bool = False):
+    """EM for a K-state multivariate-Gaussian NH-HMM. Warm-start from `init`.
+    diag=True fits diagonal emission covariances (exp_004_diag_sigma ablation)."""
     Dc = Xc.shape[1]
     if init is not None:
         mu = init.mu.copy()
@@ -521,6 +539,8 @@ def baum_welch_nh_mvn(X, Xc, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
         A0 = np.full((K, K), 0.05 / (K - 1))
         np.fill_diagonal(A0, 0.95)
         W = _sticky_W_init(A0, Dc)
+    if diag:
+        Sigma = _diagonalize_cov(Sigma)               # project init onto diagonal family
 
     prev_ll = -np.inf
     converged = False
@@ -532,7 +552,7 @@ def baum_welch_nh_mvn(X, Xc, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
         # M-step
         log_pi = log_gamma[0] - logsumexp(log_gamma[0])
         W = nh_transition_mstep(log_xi, Xc, W, maxiter=trans_maxiter)
-        mu, Sigma = m_step_mvn(X, log_gamma)
+        mu, Sigma = m_step_mvn(X, log_gamma, diag=diag)
         if np.isfinite(ll) and abs(ll - prev_ll) < tol:
             converged = True
             it += 1
@@ -542,15 +562,15 @@ def baum_welch_nh_mvn(X, Xc, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
 
 
 def fit_nh_mvn_with_restarts(X, Xc, K, n_restarts=3, seed=20260603,
-                             init: Optional["NHMVNFit"] = None):
+                             init: Optional["NHMVNFit"] = None, diag: bool = False):
     if init is not None:
-        return baum_welch_nh_mvn(X, Xc, K, init=init, max_iter=40)
+        return baum_welch_nh_mvn(X, Xc, K, init=init, max_iter=40, diag=diag)
     best = None
     master = np.random.default_rng(seed)
     for r in range(n_restarts):
         rng = np.random.default_rng(master.integers(1 << 31))
         jitter = 0.0 if r == 0 else 0.25
-        fit = baum_welch_nh_mvn(X, Xc, K, rng=rng, jitter=jitter)
+        fit = baum_welch_nh_mvn(X, Xc, K, rng=rng, jitter=jitter, diag=diag)
         if best is None or (np.isfinite(fit.log_likelihood) and
                             fit.log_likelihood > best.log_likelihood):
             best = fit
@@ -576,11 +596,12 @@ class HomogMVNFit:
 
 
 def baum_welch_homog_mvn(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
-                         init: Optional["HomogMVNFit"] = None):
+                         init: Optional["HomogMVNFit"] = None, diag: bool = False):
     """EM for a K-state multivariate-Gaussian HMM with homogeneous transitions.
 
     Same emission body and warm-start discipline as the NH driver, but the
-    transition M-step is the closed-form normalised-xi update (no inner optimise)."""
+    transition M-step is the closed-form normalised-xi update (no inner optimise).
+    diag=True fits diagonal emission covariances."""
     if init is not None:
         mu = init.mu.copy()
         Sigma = init.Sigma.copy()
@@ -593,6 +614,8 @@ def baum_welch_homog_mvn(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
         A0 = np.full((K, K), 0.05 / (K - 1))
         np.fill_diagonal(A0, 0.95)
         log_A = np.log(A0 + 1e-12)
+    if diag:
+        Sigma = _diagonalize_cov(Sigma)
 
     prev_ll = -np.inf
     converged = False
@@ -601,7 +624,7 @@ def baum_welch_homog_mvn(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
         log_B = mvn_log_emissions(X, mu, Sigma)
         log_gamma, log_xi, ll = forward_backward(log_pi, log_A, log_B)
         log_pi, log_A = m_step_init_trans(log_gamma, log_xi)
-        mu, Sigma = m_step_mvn(X, log_gamma)
+        mu, Sigma = m_step_mvn(X, log_gamma, diag=diag)
         if np.isfinite(ll) and abs(ll - prev_ll) < tol:
             converged = True
             it += 1
@@ -611,15 +634,15 @@ def baum_welch_homog_mvn(X, K, rng=None, max_iter=120, tol=1e-4, jitter=0.0,
 
 
 def fit_homog_mvn_with_restarts(X, K, n_restarts=3, seed=20260603,
-                                init: Optional["HomogMVNFit"] = None):
+                                init: Optional["HomogMVNFit"] = None, diag: bool = False):
     if init is not None:
-        return baum_welch_homog_mvn(X, K, init=init, max_iter=40)
+        return baum_welch_homog_mvn(X, K, init=init, max_iter=40, diag=diag)
     best = None
     master = np.random.default_rng(seed)
     for r in range(n_restarts):
         rng = np.random.default_rng(master.integers(1 << 31))
         jitter = 0.0 if r == 0 else 0.25
-        fit = baum_welch_homog_mvn(X, K, rng=rng, jitter=jitter)
+        fit = baum_welch_homog_mvn(X, K, rng=rng, jitter=jitter, diag=diag)
         if best is None or (np.isfinite(fit.log_likelihood) and
                             fit.log_likelihood > best.log_likelihood):
             best = fit
@@ -930,7 +953,8 @@ class ProposalModel:
 
 def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
                           feature_fn=None, transitions: str = "nh",
-                          emission: str = "mvn", order_channel: int = 0):
+                          emission: str = "mvn", order_channel: int = 0,
+                          cov_type: str = "full"):
     """Stateful factory for the MVN/MVT proposal family: cold-start k-means +
     jittered restarts on the first call, warm-start single-EM thereafter (the
     walk-forward tractability trick from the baseline, carried over here).
@@ -938,9 +962,14 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
     `transitions` selects 'nh' (softmax-VIX, exp_002/exp_004/exp_006) or 'homog'
     (closed-form, exp_003/exp_005). `emission` selects 'mvn' (Gaussian) or 'mvt'
     (Student-t, exp_005/exp_006). `feature_fn` selects the observation channels
-    (trivariate by default; drawdown-only for exp_004)."""
+    (trivariate by default; drawdown-only for exp_004). `cov_type` selects 'full'
+    or 'diag' covariance for the Gaussian emission (diagonal backs
+    exp_004_diag_sigma; ignored for the Student-t emission, which is full-scale)."""
     if feature_fn is None:
         feature_fn = trivariate_features
+    diag = (cov_type == "diag")
+    if diag and emission == "mvt":
+        raise ValueError("cov_type='diag' is only implemented for the Gaussian (mvn) emission")
     state = {"last_fit": None}
 
     def factory(train_data: pd.DataFrame) -> ProposalModel:
@@ -961,20 +990,23 @@ def make_proposal_factory(K: int = 3, n_restarts_cold: int = 3,
         Xc = np.column_stack([np.ones_like(vz), vz])
 
         if transitions == "nh":
-            fit_fn = fit_nh_mvt_with_restarts if emission == "mvt" else fit_nh_mvn_with_restarts
-            if state["last_fit"] is None:
-                fit = fit_fn(Xz, Xc, K=K, n_restarts=n_restarts_cold)
+            if emission == "mvt":
+                fit_fn, extra = fit_nh_mvt_with_restarts, {}
             else:
-                fit = fit_fn(Xz, Xc, K=K, init=state["last_fit"])
+                fit_fn, extra = fit_nh_mvn_with_restarts, {"diag": diag}
+            if state["last_fit"] is None:
+                fit = fit_fn(Xz, Xc, K=K, n_restarts=n_restarts_cold, **extra)
+            else:
+                fit = fit_fn(Xz, Xc, K=K, init=state["last_fit"], **extra)
         elif transitions == "homog":
             if emission == "mvt":
-                fit_fn = fit_homog_mvt_with_restarts
+                fit_fn, extra = fit_homog_mvt_with_restarts, {}
             else:
-                fit_fn = fit_homog_mvn_with_restarts
+                fit_fn, extra = fit_homog_mvn_with_restarts, {"diag": diag}
             if state["last_fit"] is None:
-                fit = fit_fn(Xz, K=K, n_restarts=n_restarts_cold)
+                fit = fit_fn(Xz, K=K, n_restarts=n_restarts_cold, **extra)
             else:
-                fit = fit_fn(Xz, K=K, init=state["last_fit"])
+                fit = fit_fn(Xz, K=K, init=state["last_fit"], **extra)
         else:
             raise ValueError(f"unknown transitions={transitions!r}")
 
@@ -1023,6 +1055,43 @@ def run_exp_002_proposal_k3() -> None:
         emission="mvn_full",
         transitions="nh_softmax_vix",
         comment="Proposal: K=3 full-Sigma MVN on (r,vol5,dd200), NH-HMM softmax(VIX). Return-sort labelling.",
+    )
+
+
+def run_exp_003_proposal_k4() -> None:
+    """Phase-2 robustness branch (taken because exp_002 beat exp_001 substantively
+    under the new score): same as exp_002 (trivariate full-Σ MVN + NH-softmax(VIX))
+    but K=4. Tests whether a fourth state earns its keep under the misclassification
+    score — e.g. a distinct violent-crash state separate from the grinding-deep
+    bear (the COVID-vs-2018 distinction paper 3 / the prior report flagged).
+    K>3 buckets to 3 canonical columns by return-rank thirds (first→bear,
+    last→bull, middle→ranging)."""
+    factory = make_proposal_factory(K=4, n_restarts_cold=3)
+    harness.evaluate(
+        experiment_id="exp_003_proposal_k4",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=4,
+        emission="mvn_full",
+        transitions="nh_softmax_vix",
+        comment="Phase2 robustness: exp_002 at K=4. Does a 4th state earn under misclassification? thirds-bucket labels.",
+    )
+
+
+def run_exp_004_diag_sigma() -> None:
+    """Phase-2 robustness branch: same as exp_002 (K=3 trivariate MVN +
+    NH-softmax(VIX)) but DIAGONAL Σ. Tests whether the full covariance's
+    cross-channel terms (return×vol, vol×drawdown, …) earn their keep on top of
+    the NH-transition win, or whether per-channel variances already suffice."""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3, cov_type="diag")
+    harness.evaluate(
+        experiment_id="exp_004_diag_sigma",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_diag",
+        transitions="nh_softmax_vix",
+        comment="Phase2 robustness: exp_002 with diagonal Sigma. Do cross-channel covariance terms earn their keep?",
     )
 
 
@@ -1115,6 +1184,11 @@ def run_exp_006_mvt_nh() -> None:
 EXPERIMENTS = {
     "exp_001_baseline": run_exp_001_baseline,
     "exp_002_proposal_k3": run_exp_002_proposal_k3,
+    # Phase-2 robustness branch (exp_002 beat baseline under the new score):
+    "exp_003_proposal_k4": run_exp_003_proposal_k4,
+    "exp_004_diag_sigma": run_exp_004_diag_sigma,
+    # Phase-2 ablation branch (kept from the prior old-score run; not on this
+    # run's active path but still runnable for completeness):
     "exp_003_multivariate_only": run_exp_003_multivariate_only,
     "exp_004_nh_only": run_exp_004_nh_only,
     "exp_005_mvt_homog": run_exp_005_mvt_homog,
