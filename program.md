@@ -1,179 +1,308 @@
-# autoresearch — trader-research (bear specialist)
+# autoresearch — trader-research (HMM regime detector)
 
-Autonomously iterate on the **bear specialist** strategy in this repo. The
-full production stack is an HMM regime detector + per-regime specialists +
-meta-allocator; this repo carves out only the bear specialist, evaluated on
-the 2022 bear-market window over a small subset of tokens
-(`data/bear_portfolio_candles.csv`).
+Autonomously iterate on the **HMM regime detector** in this repo. The
+goal is to find the highest-scoring HMM or NH-HMM variant for BTC
+regime classification, where score is the macro-averaged mean
+posterior probability assigned to the correct label over five
+consensus regime periods.
 
-The loop sweeps the parameters of the bear specialist one at a time. After
-each sweep, the best-scoring value is locked in as the new default and the
-loop moves to the next parameter. The scalar metric is `ensemble_score`
-from `harness.py` — the name is inherited from the full ensemble's scoring
-contract and stays fixed even though only one specialist is under test
-here.
+This iteration is **not a parameter sweep** (unlike `program_1.md`).
+It is a small ladder of architectural hypothesis tests, each a full
+named experiment. K is fixed at 3 by external decision (operational
+mapping to bear/bull/ranging specialists in the Rust pipeline); the
+loop varies emission family, observation channels, and transition
+structure.
 
 ## Setup
 
 The human starts you in a git repo already on an `autoresearch/<tag>`
-branch. **Do not create branches.** Work in the current directory, commit to
-the current branch.
+branch. **Do not create branches.** Work in the current directory,
+commit to the current branch.
 
 On startup, read these files for context:
 
 - `README.md` — repo context.
-- `harness.py` — data loader, backtest skeleton, scoring, fee / capital
-  constants. **DO NOT MODIFY.**
-- `sweep.py` — `GemParams`, model body (`fit_token_exponential`,
-  `build_portfolio`), single-parameter sweep driver. This is your playground.
-- `data/bear_portfolio_candles.csv` — the only dataset. Verify it exists; if
-  not, stop and tell the human.
+- `harness.py` — data loader, label loader, scoring, causal walk-forward
+  driver, TSV append protocol. **DO NOT MODIFY.**
+- `sweep.py` — HMM model body (forward-backward, Baum-Welch, M-steps,
+  emissions) and named-experiment runners. This is your playground.
+- `data/btcusdt_daily.csv` — extended 2017-08-17 → 2025-12-31 BTC daily.
+- `data/vix_daily.csv` — VIX daily over the same window (transition
+  covariate for NH-HMM variants).
+- `data/consensus_labels.tsv` — ground-truth regime period table.
+- `references/literature_review.org` — distilled review of the four
+  regime-switching / HMM crypto papers (PDFs alongside it): per-paper
+  "what it implies for our setup", a failures→fixes mapping, and
+  follow-up ideas **ranked by code-reuse vs. likelihood-of-pass** (Tier
+  1-3). **Draw new hypotheses and Phase-3 experiment proposals from
+  here** (together with the hypothesis pool under "Research directions").
 
-If a stale `results/bear_sweep_results.tsv` exists from a prior run, move it
-aside (`mv results/bear_sweep_results.tsv results/bear_sweep_results.tsv.bak`)
+If a stale `results/regime_sweep_results.tsv` exists from a prior run,
+move it aside
+(`mv results/regime_sweep_results.tsv results/regime_sweep_results.tsv.bak`)
 so this run starts clean.
+
+The prior iteration's scaffolding lives at `program_1.md`,
+`harness_1.py`, `sweep_1.py`, `results/bear_sweep_results_1.tsv`. You
+do not need to read them; they're preserved as historical record.
 
 ## What you CAN edit
 
 - `sweep.py` — everything in it is fair game.
-  - `GemParams` defaults and fields.
-  - The model body: `fit_token_exponential`, `build_portfolio`, the
-    regression / ATR primitives.
-  - The sweep driver, candidate values, output formatting.
+  - The HMM core: forward-backward, Viterbi, Baum-Welch driver.
+  - Emission log-pdfs and M-steps (Gaussian, Student-t, multivariate
+    Gaussian with full Σ).
+  - Transition-matrix M-step (homogeneous closed-form; NH-HMM softmax
+    via `scipy.optimize`).
+  - Feature pipelines (drawdown, realised vol, scaled log-price, etc.).
+  - Named-experiment runners that map an experiment ID to a (feature,
+    emission, K, transitions, init) configuration.
 - New helper modules under the repo root if a hypothesis needs them.
 
 ## What you CANNOT edit
 
-- `harness.py` — the contract surface (data loader, backtest skeleton,
-  metric aggregator, `ensemble_score`, `FEE_RATE` / `FEE_STRESS_MULTIPLIER` /
-  `INITIAL_CAPITAL` constants).
-- The scoring rule. `ensemble_score` is the ground-truth metric. It is
+- `harness.py` — the contract surface: data loader, label loader,
+  scoring function (`regime_score`), causal walk-forward driver, TSV
+  append helper.
+- The scoring rule. `regime_score` is the ground-truth metric. It is
   intentionally a single scalar so the optimizer cannot rewrite it.
-- `fee_rate` or `initial_capital` — these are external constraints
-  (exchange fees, portfolio sizing), not strategy parameters. The harness
-  pins them inside `evaluate`; whatever your `GemParams` holds for these
-  fields is overridden.
-- Dependencies. The stack is `numpy`, `pandas`, `scipy`. Do not add more
-  without explicit human confirmation.
+- `data/**` — the BTC + VIX series and the consensus labels are frozen
+  test sets.
+- `program.md` — these instructions.
+- Dependencies. The stack is `numpy`, `pandas`, `scipy`. Do not add
+  more without explicit human confirmation.
 
 ## Scoring rule
 
-`ensemble_score` from `harness.py`:
+`regime_score` from `harness.py` — a smooth, severity-weighted Brier
+score, **`regime_score = Q · R`**:
 
 ```
-score = annualized_return × drawdown_dampener × diversification_bonus
+s_P = 1 − mean over days d in P of:  L_d / (BRIER_HIT + BRIER_OPP)
+L_d = BRIER_HIT     · (1 − posterior[d, correct] )²
+    + BRIER_RANGING ·      posterior[d, ranging]  ²
+    + BRIER_OPP     ·      posterior[d, opposite] ²
+Q   = ( Π over the five consensus periods P of s_P )^(1/5)   # geometric mean
+R   = exp( −NONCONV_LAMBDA · nonconvergence_rate )
 ```
 
-- `drawdown_dampener = 1 / (1 + max(0, dd - 0.15))²` — 15% free zone, then
-  quadratic decay.
-- `diversification_bonus = 1 + 0.1 × (1 - hhi)` — up to +10% for portfolio
-  diversity.
+Range [0, 1], higher is better. The per-day loss weights each label
+class by its **role** relative to the period's true label: the correct
+class (`BRIER_HIT = 1`), the cautious middle ranging
+(`BRIER_RANGING = 0.25`), and the opposite extreme — the catastrophe,
+e.g. bull-mass during a bear (`BRIER_OPP = 8`). The two terms in tension
+(hit vs. catastrophe) reward confident-correct calls, punish
+confident-wrong-direction calls, and forgive caution.
 
-Hard rejection (`-inf`) on either:
+The macro-average is a **geometric mean** over the **five consensus
+periods** (2018 bear, 2020-Q1 COVID, 2020-Q2→2021-Q4 bull, 2022 bear,
+2024 post-ETF bull) — a soft minimum, so one blind regime drags the
+score down hard but smoothly: every regime must be caught. The
+reliability factor `R` folds non-convergence in smoothly
+(`NONCONV_LAMBDA = 7` → 10 % failures roughly halve the score).
 
-- Annualized return below -50%.
-- Stress-test calmar ratio (1.5× fees) is negative.
+**No hard rejections, no `-inf`.** The statistic is finite and smooth
+everywhere, so the selection loop always has a ranking gradient. NaN /
+numerically-failed posteriors are scored as the uniform "don't know"
+distribution, not dropped (so a model cannot inflate its score by
+failing on hard days).
 
-A candidate beats the current best iff its `ensemble_score` is strictly
-higher.
+A candidate beats the current best if its `regime_score` is strictly
+higher. **Scores under this rule are NOT comparable to pre-2026-06-14
+TSV rows** — re-score `exp_001_baseline` under the new statistic before
+comparing.
 
-## Research directions (parameter priority)
+## Discipline locked into `harness.py` (not sweep-able)
 
-Sweep the bear-specialist parameters in this order. After the winner of
-one parameter is locked in as the new default, move to the next.
+- **Causal walk-forward**: at each evaluation day t, the HMM is fit on
+  `[0..t-1]` and scores posterior at `t`. Refit cadence is **monthly**
+  (every 30 days, `REFIT_CADENCE_DAYS` in `harness.py`) — paper 2's
+  "30-60 day single-regime persistence" finding puts monthly at the low
+  end of that range, giving the fit room to absorb regime shifts at a
+  ~10x compute saving over weekly. Posteriors between refits use the
+  most recent fit's parameters applied forward.
+- **Baseline**: established by `exp_001_baseline` (K=3 Gaussian on
+  rolling-200-day drawdown, homogeneous transitions). Every subsequent
+  experiment is compared against this row in the TSV.
+- **Drawdown** uses a **rolling-200-day** max (`d_t = log(p_t) −
+  max_{s ∈ [t-199, t]} log(p_s)`). This kills the window-edge artefact
+  the running-max-since-start version had. The first 199 days of the
+  series are inside the warm-up and excluded from scoring.
 
-**Tier 1 — structural knobs, sweep first:**
+## Research directions (the experiment ladder)
 
-1. `top_n` over `[1, 3, 5, 10]` — portfolio breadth.
-2. `r2_threshold` over `[0.3, 0.5, 0.7, 0.8]` — fit-quality cutoff.
-3. `rebalance_cooldown` over `[3, 7, 14, 21]` — churn rate.
-4. `atr_window` over `[7, 14, 21, 30]` — ATR weighting window.
-5. `fit_window` over `[20, 30, 60, 90]` — exponential-fit history length.
+This is a **ladder of named experiments**, not a parameter sweep.
+Don't enumerate candidate values; run the next named experiment from
+the ladder, score it, decide where to go next.
 
-**Tier 2 — finer knobs:**
+**Phase 1 — establish baseline, fire main comparison** (the minimum):
 
-6. `momentum_cap` over `[0.05, 0.10, 0.14, 0.20, 0.50]`.
-7. `r2_exponent` over `[1.0, 1.5, 2.0, 3.0]`.
+1. `exp_001_baseline` — K=3 Gaussian on rolling-200 drawdown
+   (univariate), homogeneous transitions. Re-runs the current
+   best-in-class HMM with the new misclassification scoring on the
+   extended 2017-2024 window.
+2. `exp_002_proposal_k3` — K=3 Gaussian on trivariate
+   (rₜ, σₜ^{5d}, dₜ_{200}), full Σ, NH-HMM transitions with VIX as the
+   covariate (x_t = (1, VIX_t)). The literature-tier proposal.
 
-After Tier 2, re-sweep Tier 1 with new defaults locked in to catch
-interactions, or zoom in around a Tier 1 winner with a finer grid.
+**Phase 2 — branch on Phase 1 outcome**:
+
+If `exp_002` beats `exp_001` (substantively, not by a hair): *robustness
+branch*:
+
+3a. `exp_003_proposal_k4` — same as exp_002, K=4. Does the extra
+    state earn under misclassification (where it earned under BIC in
+    `regime_drawdown_k4_2022.org`)?
+4a. `exp_004_diag_sigma` — same as exp_002, diagonal Σ. Does full Σ
+    actually buy anything, or did diagonal suffice?
+
+If `exp_002` does NOT beat `exp_001`: *ablation branch*:
+
+3b. `exp_003_multivariate_only` — trivariate + homogeneous transitions.
+    Isolates whether the multivariate observation alone helps.
+4b. `exp_004_nh_only` — drawdown univariate + NH-HMM with VIX. Isolates
+    whether the non-homogeneous transitions alone help.
+
+**Phase 3** — your call. Based on Phase 2 results, propose 1-3 follow-up
+experiments that close remaining ambiguities, or move toward Student-t
+emissions (paper 3) / semi-Markov sojourn (paper 4) variants if the
+mass of evidence suggests they're worth trying. You may also draw from
+the **hypothesis pool** below and the ranked Tier 1-3 follow-ups in
+`references/literature_review.org`. Stop when (a) a winner has been
+established AND its dominant components have been ablated, or (b) the
+human interrupts.
+
+### Hypothesis pool (the loop may draw from these)
+
+Open directions, not yet on the ladder. Promote one into a named
+experiment when the evidence suggests it's worth a walk-forward.
+
+- **State→label projection stability.** The K-state→{bear,ranging,bull}
+  map is currently a hard `argsort(μ)` on one channel (`sweep.py`
+  `BaselineModel`/`ProposalModel`). When two states' means cross — between
+  refits, or between two nearby architectures — the posterior columns
+  relabel and `regime_score` jumps for reasons unrelated to model
+  quality. The harness score is smooth *given* posteriors; this is the
+  one remaining seam, in the (mutable) modeling layer. Most fragile for
+  K≥4 (thirds-bucketing) and the multivariate proposal (states close on
+  the return channel). Candidate variants to try and score like any
+  other experiment:
+  - *identity-pin*: compute the state→label map once at cold-start and
+    reuse it for all warm-started refits (warm-start preserves state
+    identity, so the map stays stable). Semantics: labels track state
+    *identity* rather than current μ-rank.
+  - *anchored cutpoints*: assign by absolute μ thresholds on the order
+    channel instead of rank (no rank-flips; risks empty buckets).
+  - *cross-refit matching*: Hungarian/greedy match each refit's states to
+    the previous refit's labels for within-experiment stability.
+  Success criterion: improves (or doesn't distort) `regime_score` while
+  reducing run-to-run / neighbour-architecture score variance. Underlying
+  semantic choice — identity vs. μ-rank — is itself part of the
+  hypothesis.
+
+## TSV row schema
+
+`results/regime_sweep_results.tsv` is **append-only**. Each row is one
+full experiment. Tab-separated. The append helper in `harness.py`
+writes one row per `evaluate()` call.
+
+Columns (in order):
+
+```
+experiment_id  observation  K  emission  transitions  regime_score
+score_2018_bear  score_2020q1_covid  score_bull_2020_2021
+score_2022_bear  score_2024_etf_bull
+ll_mean  argmax_acc  flip_count  comment
+```
+
+The `comment` column is free-text — use it to record the hypothesis
+the experiment tested and the takeaway, in ≤ 120 chars.
 
 ## Output format
 
-Each `python sweep.py --param X --values v1,v2,...` run prints one line per
-candidate to stdout AND appends a row to `results/bear_sweep_results.tsv`.
-Extract the result with:
+Each `python sweep.py --experiment <experiment_id>` run prints one
+human-readable block to stdout AND appends a row to
+`results/regime_sweep_results.tsv`. Extract the result with:
 
 ```
-grep -E "^Best:|^Done\." run.log
-tail -10 results/bear_sweep_results.tsv
+grep -E "^Score:|^Done\." run.log
+tail -5 results/regime_sweep_results.tsv
 ```
 
 ## Experiment loop
 
-LOOP OVER PARAMETERS:
+LOOP OVER EXPERIMENTS:
 
-1. Look at git state: which parameters have already been swept and locked
-   in (look at `GemParams` defaults and recent commits).
-2. Pick the next parameter from the priority order above. If all are done,
-   start a second pass with the new defaults locked in, or zoom into a
-   prior winner with a finer grid.
-3. Pick a candidate list. Use the suggested list, or narrow / widen it
-   based on prior wins.
-4. Run the sweep:
-   `python sweep.py --param <name> --values <v1,v2,...> > run.log 2>&1`
-   (Redirect everything — do NOT `tee` or let output flood your context.)
-5. Read out the result: `grep -E "^Best:|^Done\." run.log`.
-6. If the run crashed: `tail -50 run.log` to read the traceback, attempt a
-   fix. If you can't unblock after 2-3 tries, drop the parameter and move
-   on.
-7. If a finite-score winner exists and beats the current default, update
-   the default in `GemParams` in `sweep.py` to the winning value and
-   `git commit -am "<param>=<value> (score <best> from <baseline>)"`.
-   If every candidate returned `-inf`, do not modify `GemParams`; treat
-   the parameter zone as hostile under current defaults and move on.
-8. Repeat.
+1. Look at TSV state: which experiments have run, which won, which
+   failed the hard rejection.
+2. Pick the next experiment from the ladder above. If Phase 1 not
+   complete, run the next Phase 1 experiment. If Phase 1 complete,
+   pick the Phase 2 branch based on `exp_001` vs `exp_002` outcome.
+   If Phase 2 complete, propose a Phase 3 experiment.
+3. If the experiment requires new code in `sweep.py` (e.g. multivariate
+   M-step for exp_002 the first time you reach it), implement it.
+   Sanity-check on a tiny synthetic window before running the full
+   evaluation.
+4. Run the experiment:
+   `python sweep.py --experiment <experiment_id> > run.log 2>&1`
+   (Redirect everything — do NOT `tee` or let output flood your
+   context.)
+5. Read out the result: `grep -E "^Score:|^Done\." run.log`.
+6. If the run crashed: `tail -50 run.log` to read the traceback, attempt
+   a fix. If you can't unblock after 2-3 tries, mark the experiment
+   FAILED in the TSV's `comment` column and move on.
+7. If the new experiment beats the current best, commit your code:
+   `git commit -am "<experiment_id> regime_score=<score> beats <baseline_id>"`.
+   If it doesn't beat baseline, still commit the code (the TSV row is
+   the durable record):
+   `git commit -am "<experiment_id> regime_score=<score> below <baseline_id>"`.
+8. Decide the next experiment based on Phase 2 / Phase 3 branching.
+   Repeat.
 
-**Timeout:** a single parameter sweep should finish in well under a
-minute. If a run exceeds 5 minutes, kill it, narrow the grid, and treat
-the run as a failure.
+**Timeout**: a single experiment evaluation should finish in well
+under 10 minutes (the causal walk-forward over 2017-2024 with weekly
+refit is ~470 fits per evaluation × seconds-per-fit). If a run exceeds
+30 minutes, kill it, debug, and either narrow the evaluation window
+or simplify the model body.
 
-**NEVER STOP:** The loop runs until the human interrupts you. Do not pause
-to ask "should I keep going?" — the human might be asleep. If you run out
-of priority-list parameters, re-read this file and `sweep.py` for new
-angles — try a deletion (toggle a `use_*` flag off), zoom into the
-neighborhood of a Tier 1 winner, or try combinations. The loop runs until
-interrupted, period.
+**NEVER STOP**: The loop runs until the human interrupts you OR Phase
+3's stopping condition is met (winner established + ablations
+explained). Do not pause to ask "should I keep going?" — the human
+might be asleep.
 
 ## Shutdown report (mandatory)
 
-When the experiment loop ends — whether interrupted by the human, hitting
-a proven ceiling, or running out of context — **always** generate a
-shutdown report before doing anything else. This is not optional.
+When the experiment loop ends — interrupted, winner-confirmed, or
+context-exhausted — **always** generate a shutdown report before doing
+anything else.
 
 Write the report to
-`docs/autoresearch-reports/<YYYY-MM-DD>-autoresearch-<tag>-report.md`
-where `<tag>` is the branch name or loop identifier.
+`docs/autoresearch-reports/<YYYY-MM-DD>-regime-autoresearch-report.md`.
 
 ### Required sections
 
-1. **Executive summary** (2-3 sentences): parameters swept, kept /
-   discarded count, headline finding.
+1. **Executive summary** (2-3 sentences): experiments run, headline
+   finding, whether the proposal beat baseline, what the winner was.
 2. **Runtime**: wall-clock time (first to last commit), per-experiment
-   average, session breakdown if the loop spanned multiple conversations.
-3. **Per-parameter table**: one row per parameter swept — candidate values
-   tried, winner, score before, score after, delta.
-4. **Validated findings**: non-obvious engineering knowledge discovered.
-   Things that would surprise a reader who hadn't run the experiments.
-   Insights about behavior, not parameter values.
+   average.
+3. **Per-experiment table**: one row per experiment — experiment_id,
+   one-line architectural summary, regime_score, vs-baseline delta,
+   pass/fail/borderline verdict, brief comment.
+4. **Validated findings**: non-obvious engineering knowledge
+   discovered. Things that would surprise a reader who hadn't run the
+   experiments. Insights about behavior, not parameter values.
 5. **Fundamental limitations**: structural constraints that prevent
-   further progress within the current framework. In particular: parameter
-   interactions a one-at-a-time sweep cannot discover.
-6. **Recommendations**: organized as near-term (next sweeps to try),
-   medium-term (model-body changes), long-term (architecture / scoring
-   changes). Concrete and actionable.
+   further progress within the current framework. In particular: the
+   misclassification scoring is silent about flips between adjacent
+   regimes (bull → ranging → bull); a fast-cycling but-mostly-correct
+   variant scores the same as a slow-cycling correct variant.
+6. **Recommendations**: organized as near-term (next experiments to
+   try), medium-term (model-body changes — Student-t emissions,
+   semi-Markov sojourn), long-term (architecture / scoring changes
+   — bull/ranging Python ports, full ensemble_score integration with
+   the Rust pipeline).
 
 ### Appendix
 
-Final `GemParams` (winning configuration) and its scores across base and
-stress backtests.
+Final winning experiment's full configuration and its per-period
+score breakdown.

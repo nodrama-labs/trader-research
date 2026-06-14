@@ -1,0 +1,482 @@
+* Description
+
+Literature review covering the four papers in =references/=, motivated
+by the negative result in [[file:regime_student_t_2022.org][regime_student_t_2022.org]]. Goal: map each
+paper's methodological choices (features, state count, transitions,
+covariates, frequency) to the specific failure modes our Phase-0 run
+exhibited, and use that mapping to design a follow-up that keeps the
+same data and the same comparison frame but changes what plausibly
+fixes the failure.
+
+We are not synthesising the entire HMM-in-crypto literature — only what
+these four papers tell us about choices our notebook made.
+
+* Recap: what Phase-0 actually showed
+
+The Phase-0 hypothesis was that a 3-state Student's-t HMM, fit to BTC
+*daily log-returns* over 2021-06 → 2023-06 with μ-sort labelling, would
+identify 2022 as a sustained bear. It did not. Concretely:
+
+- Student's-t Viterbi placed 100 % of 2022 (and 100 % of 2021-H2 bull
+  and 100 % of 2023-H1 recovery) into a single "ranging" state.
+- ν̂ collapsed to ≈4 in every state under bounds [3, 30] — uniformly
+  fat-tailed, not regime-dependent fat-tailed.
+- Gaussian and Student's-t both bound "bear" by μ-sort to the small
+  cluster of crash *days* (LUNA, Celsius, FTX), not bear *months*.
+- The model is correctly reporting that daily 2022 returns look like a
+  fat-tailed walk near zero — the same as every other post-2021 window.
+  The feature is the problem, not the model.
+
+The four candidate fixes implicit in that diagnosis were: change the
+*feature*, change the *state count*, allow the *transitions to vary*,
+or change the *frequency*. The literature touches all four.
+
+* Paper 1 — Shih, Huang, Hsu (2024). Bitcoin Cycle through Markov Regime-Switching Model
+
+** Setup
+- Asset: BTC (USD, weekly).
+- Window: Jan 2018 → Sep 2022 (~250 weekly obs).
+- Model: classic Hamilton MS-AR(q) with 2 states (high-growth, low-growth),
+  Gaussian shocks, fixed transition matrix.
+- Four variants: BTC-only (Model I), + VIX (II), + USD index (III),
+  + both (IV) — covariates enter the *mean equation*, not the
+  transition matrix.
+
+** Fitted parameters (Model I, BTC-only)
+- σ₁ = 0.007 (high-growth), σ₂ = 0.053 (low-growth) — ratio ≈ 7.5×.
+- μ₁ = 0.010, μ₂ = 0.091 (note: μ₂ > μ₁; "bear" here means high-σ +
+  high mean, i.e. *turbulent positive-drift* rather than sustained
+  negative drift — same gotcha our μ-sort labelling tripped on).
+- p₁₁ = 0.975, p₂₂ = 0.881 → expected durations 40 vs 8 weeks.
+- Adding USD index (Model III) extends bull duration 40 → 48 weeks,
+  bear 8 → 10 weeks. Both VIX and USD enter with negative coefficients
+  on the BTC mean.
+
+** What it implies for our setup
+- *Frequency*: weekly aggregates 5 daily observations into one. That
+  averages out the crash-day spikes that captured our "bear" label.
+  Their LG/HG separation works partly because of this smoothing.
+- *State count*: K = 2 is enough at weekly frequency; we tried K = 3
+  at daily and the third state degenerated.
+- *Labelling*: their HG/LG is σ-driven, not μ-driven. In a heavy-tailed
+  regime the right contrast is volatility, not mean. Sort states by σ
+  (or by σ × −μ) rather than μ.
+- *Covariates in mean*: weakest form of "non-homogeneous" — does not
+  let the transition matrix shift with VIX/USD, just lets the
+  conditional mean re-centre. Worth checking but unlikely to fix our
+  problem because in 2022 BTC daily returns the cross-correlation
+  with VIX/USD is modest at the noisy daily scale.
+
+** Verdict for follow-up
+Switching to weekly is a real-but-blunt fix: it shrinks the sample
+from 759 daily obs to ~108 weekly, which makes K = 3 marginal and K = 4
+infeasible. Useful as a robustness check; not the primary path.
+
+* Paper 2 — Pakštaitė et al. (2025). Bayesian MCMC + (NH-)HMM with macro covariates
+
+** Setup
+- Asset: BTC (USD, daily). Window: Jun 2016 → Dec 2024 (~3100 obs).
+- Observation: *log-transformed scaled price* — explicitly not log-returns.
+- Models: 2-state HMM (homogeneous) and NH-HMM (transitions logistic-
+  parameterised in covariates via Pólya–Gamma augmentation).
+- 16 candidate covariates (macro: SPX, DJI, IXIC, VIX, INFL,
+  EURUSD/GBPUSD/JPYUSD/CNYUSD, GC_F, CL_F; BTC-specific: VOL, BLOCK,
+  HASH, MINER, HALVING), lagged 7 days, selected by Bayesian MCMC with
+  a double reversible-jump algorithm and a complexity penalty.
+- Rolling 100-day window for fitting; 1/5/30-step bootstrapped forecasts.
+
+** Key empirical findings
+- Optimal covariate set is *time-varying*: in 2016–2019 BTC-specific
+  variables dominate (HALVING, INFL, GC_F); in 2019–2024 macro
+  variables dominate (CNYUSD, GBPUSD, EURUSD, DJI, HASH). Post-2019
+  BTC behaves more like a macro-sensitive asset.
+- A 100-day window matches "a single hidden state typically persists
+  for 30–60 days" — chosen explicitly so each window sees both states.
+- NH-HMM (with VIX in the transition equation) does *not* uniformly
+  beat the homogeneous HMM at 1-step-ahead; macro covariates in the
+  emission equation help more than in transitions at short horizons.
+- Best 1-step MAPE in the recent (2019–2024) sample: 25.85 % for the
+  homogeneous-HMM Set 1 (CNYUSD, DJI, GC_F, VOL).
+- LASSO, Elastic Net, Random Forest, and rolling SVM all underperform
+  the HMM framework for this task — the multicollinearity in macro
+  factors plus the regime-switching structure are not handled well by
+  generic shrinkage.
+
+** What it implies for our setup
+- *Feature choice*: modelling *log-price* (level) instead of *log-return*
+  is the simplest change that gives the latent state something
+  cumulative to anchor to — our negative-result diagnosis explicitly
+  flagged "regime structure lives at the cumulative-price level, not
+  the per-day-return level". Paper 2 validates this as a working
+  choice with the same K = 2 / Gaussian emission family.
+- *Window length*: 759 daily obs (our 2-year span) is shorter than
+  their 100-day rolling but it's only enough for ~12–25 regime
+  occurrences at their 30–60-day persistence. Tight but workable for
+  a 2 or 3-state model; not for 4.
+- *Covariates*: the best add at our window is probably DJI/CNYUSD/
+  GC_F (per their recent-sample MCMC selection) plus VIX if going
+  non-homogeneous.
+
+** Verdict for follow-up
+The cheapest, most-targeted change to our existing notebook is:
+re-fit the same Gaussian and Student's-t machinery with *log-price* as
+the observation, keeping K = 2 (their setup) and K = 3 (our setup) as
+parallel runs. Same forward-backward, same Baum-Welch driver — only
+the input array changes.
+
+* Paper 3 — Koki, Leonardos, Piliouras (2020). 4-state NH-HMM with macro predictors
+
+** Setup
+- Assets: BTC, ETH, XRP. Daily *percentage* log-returns
+  (100 × Δlog-price). BTC window: Jan 2014 → Nov 2019 (~2100 obs).
+- 12 candidate predictors: EUR/USD, GBP/USD, CNY/USD, JPY/USD, Gold,
+  Oil, SP500, VIX, 10Y Treasury Yield (TY), BTC size, BTC Hash, AR(1).
+- Compares 12 models per coin: NHHMM with m ∈ {2,3,4,5}, HHM with m ∈
+  {2,3,4,5}, plus 2-state MS-RW, random walk, AR(5), Kitchen Sink.
+- Bayesian MCMC inference with Pólya–Gamma augmentation on the
+  multinomial-logit transition probabilities; reversible-jump on
+  transition predictors.
+- Out-of-sample evaluation: CRPS and MSE at horizons 1, 2, 7, 15, 30.
+
+** Headline empirical findings
+- *Best model for BTC is 4-state NH-HMM* (lowest average CRPS across
+  horizons, 1.78 vs 1.85–1.98 for benchmarks).
+- BTC state structure (Table 6, in % log-returns; std also in %):
+
+  | State | Occupancy | Mean (%) | Std (%) | Interpretation                |
+  |     1 |     0.35  |   −0.46  |   5.91  | bear/turbulent (negative μ, high σ) |
+  |     2 |     0.30  |   +0.49  |   2.49  | bull, high-kurt                |
+  |     3 |     0.24  |   +0.47  |   1.69  | bull, low-kurt                 |
+  |     4 |     0.11  |   +0.02  |   0.53  | calm / auxiliary               |
+
+  States 2 and 3 share an almost-identical mean and differ only in
+  *kurtosis* — i.e. the model uses 4 states to encode (bear, bull-vol,
+  bull-quiet, calm). With K = 3 you cannot distinguish bull-vol from
+  bull-quiet, so EM either (a) collapses both into one Gaussian-ish
+  bull and over-flips, or (b) lets the Student-t emission absorb both
+  via a uniformly fat tail — which is exactly what our notebook saw.
+- Transition predictors with posterior inclusion probability > 0.4:
+  VIX (1.00) and TY (0.90). VIX is the universal one across BTC/ETH/XRP.
+- Predictors in the emission (regression on returns conditional on
+  state) are mostly insignificant — non-linear effects come through
+  the *transition* probabilities, not the mean.
+- They explicitly note that m > 5 is worse (parsimony loss), and that
+  removing insignificant emission predictors degrades out-of-sample
+  performance even though they are not individually significant
+  (consistent with the regime-switching ensemble argument).
+
+** What it implies for our setup
+- *State count*: K = 4 is the literature-validated choice for BTC
+  daily returns. Our K = 3 was the smallest plausible setting; it is
+  also one short.
+- *Labelling*: state 1 *is* low-μ + high-σ (concordant with our μ-sort
+  rule) but the interesting decomposition is between states 2 and 3,
+  which share a mean. A μ-only sort cannot separate them; need a
+  μ-then-σ tie-breaker or a kurtosis-aware label rule.
+- *Heavy tails*: state 1 σ = 5.91 % vs state 4 σ = 0.53 % — that's an
+  11× ratio. With Gaussian emissions this is feasible at K = 4
+  because the extreme component absorbs tail observations without
+  poisoning the others. With K = 3 and Student-t we observed the
+  reverse: the fat-tail flexibility absorbed crash days into the
+  modal component because there was no fourth bucket to send them to.
+- *NH transitions*: VIX is the dominant transition predictor across
+  all three coins. If we go non-homogeneous, VIX is the single
+  predictor that buys the most.
+
+** Verdict for follow-up
+The single highest-leverage change is K = 3 → K = 4 (with or without
+heavy tails), keeping emissions univariate-Gaussian. Paper 3 makes a
+strong case that the bull decomposes into two sub-states our K = 3 run
+cannot represent, and that this is the structural reason behind the
+"one big ranging state" failure.
+
+* Paper 4 — Malekinezhad & Rafati (2026). NHHMM on 4-hour BTC, multivariate observation
+
+** Setup
+- Asset: BTC/USDT, *4-hour candles*. Window: Jan 2024 → Jan 2026
+  (~4380 obs).
+- *Multivariate observation vector*: log return + rolling realised
+  volatility + normalised trading volume.
+- Models compared: 2-state HMM, 3-state HMM, 3-state NHHMM with
+  time-varying transitions. EM for HMM; modified EM (kernel/local
+  likelihood) for NHHMM. Viterbi for state inference.
+- States named ex-ante: low-vol consolidation, high-vol bullish
+  expansion, high-vol bearish correction.
+
+** Results
+
+  | Model    | LL    | AIC   | BIC   | Persistence | Vol RMSE |
+  | HMM K=2  | −6125 | 12270 | 12355 | medium      |   0.021  |
+  | HMM K=3  | −5874 | 11780 | 11910 | high        |   0.018  |
+  | NHHMM K=3| −5712 | 11470 | 11620 | very high   |   0.015  |
+
+- Mean regime durations: consolidation 6.2 days, bullish 4.7 days,
+  bearish 3.9 days.
+- 3-state beats 2-state across all metrics; NHHMM beats HMM at the
+  same K. Consistent with paper 3's NH-HMM dominance result on daily
+  returns, and with paper 2's finding that time-varying transitions
+  matter.
+
+** What it implies for our setup
+- *Multivariate observation* is the clean experimental knob the
+  literature uses to give the latent state more than one signal to
+  bind to. Daily log-return alone is the *minimum*-information
+  observation; (return, realised σ, log-volume) is the standard
+  multivariate one.
+- *Higher frequency* (4-hour) does *not* materially change the
+  3-state structure — it just gives more observations per regime. At
+  daily we have 759 obs; at 4-hour we'd have ~3036 over the same
+  window (4× more), which would let K = 4 be viable.
+- *Duration dependence*: paper 4 explicitly raises hidden semi-Markov
+  models (negative-binomial / Poisson sojourn distributions) as the
+  remedy when geometric sojourn is too memoryless. This is mentioned
+  as Phase-2 in our original plan; the literature endorses it but
+  also shows you can mostly fix the geometric-sojourn issue with
+  non-homogeneous transitions (NHHMM) first.
+- *Channel frequency ≠ HMM frequency*: paper 4 picks 4-hour data
+  because regime durations of ~4–6 days require sub-week sampling
+  resolution to be visible. Our 2022-bear target regime is ~250
+  trading days long, so the latent chain does not need sub-daily
+  samples. However, the *quality* of the σ channel in a (return, σ)
+  bivariate observation can be upgraded without changing the HMM
+  frequency: replace σ_t = std(r_{t-4:t}) (5 daily returns, noisy
+  estimator) with realised variance σ_t = sqrt(Σᵢ r²_{t,i}) computed
+  from N intra-day returns within day t (Andersen-Bollerslev-Diebold-
+  Labys, 2001). Standard error on σ_t collapses by ~√N — N = 78 for
+  5-min bars, N ≈ 6 for hourly. The result is still a once-per-day
+  number that slots into the daily HMM unchanged; only one column of
+  the observation matrix changes. Cost: ~50-line extension of
+  ~data/fetch_btcusdt_daily.py~ to also pull hourly (or 5-min) bars
+  over the window. Binance klines are free and go back to 2017.
+
+** Verdict for follow-up
+Multivariate observations + NHHMM (with VIX from paper 3 in the
+transitions) is the most-aligned-with-literature setup. The smallest
+plausible variant we could fit with current code is:
+*bivariate observation (return, 5-day realised σ) + Gaussian emissions
++ homogeneous K ∈ {3, 4}*. Going to NHHMM requires logistic-transition
+M-step + a VIX series.
+
+* Cross-cutting themes
+
+#+CAPTION: Methodological choices across the four papers
+| Paper             | Frequency | Observation                          | States | Trans   | Covariates                       |
+| Shih 2024         | weekly    | log-return                            | 2      | const   | VIX, USD (in mean)               |
+| Pakštaitė 2025    | daily     | log-price (level)                     | 2      | logistic| 16 macro/BTC (MCMC-selected)     |
+| Koki 2020         | daily     | log-return (×100)                     | 4      | logistic| 12 macro; VIX+TY dominate trans  |
+| Malekinezhad 2026 | 4-hour    | (log-ret, realised σ, volume)         | 3      | local   | trading activity                  |
+| /Our Phase-0/     | /daily/   | /log-return/                          | /3/    | /const/ | /none/                           |
+
+What jumps out is that *every* literature setup differs from ours on
+*at least two* of these axes simultaneously — none of them uses the
+minimal "daily log-return, K = 3, constant transitions, no covariates"
+configuration that our notebook used. The closest is Koki 2020, and
+that paper's own ablation says K = 2 is also degenerate; K = 4 NH is
+where it lands.
+
+* Mapping failures → fixes
+
+| Phase-0 failure                                                                     | Diagnosis                                                                                                                 | Literature fix                                                                                                                                | Source(s)       |
+| Viterbi puts 100 % of 2022 into one state                                            | K = 3 collapses bull-vol + bull-quiet into one bucket; EM has nowhere to send crash days; daily returns are noise-rich   | K = 4 with at least one calm/auxiliary state to absorb tails (state 4 in paper 3: σ = 0.53 %, occupancy 11 %)                                  | paper 3         |
+| Student's-t ν̂ ≈ 4 in *every* state                                                 | Fat tails are uniform, not regime-dependent, at daily-return scale                                                       | Move emission to a *level* or *multivariate* observation where regime structure is in the cumulative path or the joint (return, σ) signal     | paper 2, 4      |
+| μ-sort labelling binds "bear" to crash days, not bear months                         | μ-sort works when bear is low-μ + high-σ but cannot separate bull-vol from bull-quiet (paper 3's states 2 vs 3)         | Label by (μ ascending, σ descending) tie-break, or use the full posterior + economic interpretation of moments (mean/σ/kurtosis per state)    | paper 3         |
+| EM converges to a "fat-tailed walk near zero" basin                                  | No external signal pulls the model away from the modal distribution; transitions are i.i.d.                              | NH-HMM with VIX in the transition matrix — buys regime persistence and pulls bear/bull apart in stress periods                                  | papers 2, 3, 4  |
+| Daily returns over 2 years are too noisy and have no cumulative anchor               | σ of 2022 vs 2021 returns is indistinguishable; drift differential is well inside one-year sampling noise              | (a) switch to log-price level (paper 2); or (b) bivariate (return, realised σ_5) (paper 4); or (c) weekly aggregation (paper 1) — least preferred | papers 1, 2, 4  |
+
+Every diagnostic from our negative-result writeup has at least one
+literature-validated fix. They are not mutually exclusive.
+
+* Proposed follow-up — ranked by code reuse vs likelihood of pass
+
+The original Phase-0 setup (window 2021-06 → 2023-06; pass criteria:
+2022 bear-posterior ≥ 0.6, flips ≤ 6, gap-or-flip-reduction) is
+retained. Same window, same data, same EM driver, same restart
+strategy. What changes is one knob at a time.
+
+** Tier 1 — single-knob changes, < 100 lines of new code
+
+1. *Log-price observation, K ∈ {2, 3}, Gaussian + Student-t* (paper 2).
+   Change is one line in the data-prep cell: replace
+   ~df["log_return"]~ with ~np.log(df["close"]) − np.log(df["close"][0])~
+   (or a rolling z-score, paper 2's "scaled log-price"). Everything
+   else — forward-backward, Baum-Welch, ν-update, restart jitter,
+   Viterbi — reuses as-is. Risk: log-price is non-stationary and EM
+   may detect "year 1 vs year 2" as the latent state rather than
+   bull/bear. Mitigation: detrended log-price (subtract a 200-day MA)
+   or paper 2's scaling.
+
+2. *K = 4, daily returns, Gaussian + Student-t* (paper 3).
+   Change is one line: ~K = 3~ → ~K = 4~. Sort+labelling rule needs
+   a fourth slot ("bear", "ranging-vol", "ranging-quiet", "bull" or
+   similar) — small refactor of the regime-name tuple. Risk: K = 4
+   on 759 obs is sample-size-tight, especially with EM restarts.
+   Mitigation: drop ν floor to 2.5 (paper 3 uses uniform priors) and
+   accept the ν → ∞ limit on the "calm" state.
+
+** Tier 2 — moderate refactor, ~200-300 lines
+
+3. *Bivariate (return, realised σ_5) emission* (paper 4 — the
+   multivariate idea, simplified to 2 dims).
+   Need: 2-D Gaussian log-pdf, M-step for (μ_i ∈ ℝ², Σ_i ∈ ℝ²ˣ²),
+   either a per-state diagonal Σ or a small Wishart-style update for
+   full Σ. Forward-backward and Viterbi unchanged. Student-t version
+   needs the multivariate-t scale-mixture EM update — non-trivial
+   but well-documented. The single biggest expected-value-of-
+   information move because it fixes the "daily returns are the
+   wrong feature" diagnosis at the root. The σ channel itself can
+   optionally be upgraded from daily-return std to intra-day realised
+   variance (see paper 4 "Channel frequency ≠ HMM frequency" note)
+   for sharper regime contrast at no change to the HMM frequency or
+   sample size; minimal additional cost beyond a one-off hourly-data
+   pull. A natural third channel is *drawdown-from-rolling-max*
+   d_t = log p_t − max_{s ∈ [t−L, t]} log p_s with L = 200 days —
+   stationary, complementary to (r, σ), and the one channel that
+   directly carries cumulative-path information (the failure-mode
+   diagnosis "regime structure lives at the cumulative-price level"
+   from the Phase-0 writeup). See the composite endpoint below for
+   the assembled (r, σ, d) trinity.
+
+** Tier 3 — needs new data + new M-step
+
+4. *NH-HMM with VIX in the transition matrix* (papers 2, 3, 4 all
+   agree this is the right top of the stack).
+   Needs: VIX daily series for the window (free via Yahoo Finance,
+   tracked already if we have FRED access); softmax-parameterised
+   transition matrix log_A(t) = softmax(β_i · x_t); per-iteration
+   M-step is a small logistic regression (Pólya–Gamma or just
+   IRLS / scipy.optimize). This is the highest-effort, highest-
+   ceiling move. Probably *not* the right Phase-0.5 step — defer to
+   Phase-1 if any of the Tier-1 fixes pass.
+
+** Composite Tier 2 + 3 endpoint — recommended assembled setup
+
+If both Tier-1 fixes fail and we escalate, the literature-aligned
+endpoint that maximises expected value is *not* a further increase in
+K or in ν flexibility; it is a deliberate split of where each
+external signal enters the model. The governing principle is:
+
+#+BEGIN_QUOTE
+Emission channels are things the regime *produces*. Transition
+covariates are things the regime *responds to*.
+#+END_QUOTE
+
+Under that principle the four papers cluster cleanly:
+
+| Channel                | Caused by state? | Causes state crossings? | Slot       |
+| BTC log-return r_t     | yes              | no                       | emission   |
+| BTC realised σ_t       | yes              | no                       | emission   |
+| BTC drawdown d_t       | yes (path-dep.)  | no                       | emission   |
+| BTC log-volume v_t     | mostly yes       | only at extremes         | emission   |
+| VIX                    | no               | yes (macro stress)       | transition |
+| DXY / USD index        | no               | yes                      | transition |
+| 10Y Treasury yield     | no               | yes                      | transition |
+| BTC hash, halving      | no / scheduled   | partially                | transition |
+
+This dissolves the apparent tension between paper 1's covariates-in-
+mean approach and paper 3's covariates-in-transition approach: they
+are not competing parameterisations of the same idea but different
+slots for different *kinds* of variable. Paper 1 puts VIX in the
+emission mean, which is mechanically allowed but a weaker generative
+claim (VIX is a manifestation of regime); paper 3 puts VIX in
+transitions (VIX is a driver of regime crossings) and gets posterior
+inclusion probability 1.00 across BTC/ETH/XRP.
+
+*** Recommended assembled setup
+
+- *Emission vector*: y_t = (r_t, σ_t^realised, d_t^drawdown).
+  - r_t: daily log-return (already in notebook).
+  - σ_t: 5-day realised volatility, optionally upgraded to intra-day
+    realised variance per the paper 4 "Channel frequency ≠ HMM
+    frequency" note.
+  - d_t: drawdown from 200-day rolling max (see "drawdown gotcha"
+    below). Captures cumulative path information that (r, σ) cannot.
+- *State count*: K = 3 with the (r, σ, d) trinity should suffice —
+  paper 4 lands on K = 3 with multivariate observations precisely
+  because the extra channels do the discriminating work that paper
+  3's K = 4 was buying on scalar returns. Keep K = 4 as a robustness
+  variant; do not pre-commit.
+- *Emission family*: full-covariance Gaussian first (≈ 9 + 18 = 27
+  emission params at K = 3, D = 3 — safe at 759 obs). Student-t
+  upgrade as a robustness check; use the multivariate-t scale-
+  mixture EM with bounds [3, 30] on ν per state, as in the current
+  notebook's univariate version.
+- *Transition input*: x_t = (1, VIX_t). Softmax-parameterised
+  log A_{ij}(t) = softmax_j(β_{ij} · x_t). Optionally add the 10Y
+  Treasury yield (paper 3 posterior inclusion 0.90); DXY if going
+  beyond.
+- *Frequency*: stay daily for the latent chain (preserves the 2022-
+  bear-detection question and the Phase-0 comparison frame). Only
+  the σ channel may consume intra-day data.
+- *Pass criterion*: unchanged (median bear-posterior over 2022 ≥ 0.6,
+  Viterbi flips ≤ 6, gap ≥ 0.15 OR flip-reduction ≥ 30 %). The rule
+  worked once; do not retune it after seeing fresh results.
+
+*** Drawdown gotcha (worth flagging explicitly)
+
+Drawdown d_t depends on what is in its rolling-max window, which
+makes the channel sensitive to the lookback choice:
+
+- *Expanding max from window start*: d_t never "forgets" the all-
+  time high. Carries a structural break at every new ATH and is
+  technically non-stationary — HMM EM will tend to bind one state
+  to "regime where d_t carries memory of the 2021 peak". Not
+  recommended.
+- *Rolling max with fixed lookback L*: bounded memory, stationary,
+  recommended. L = 200 days is the default. Shorter L (50–100 days)
+  emphasises recent drawdowns and is more responsive but loses the
+  "deep multi-quarter bear" signal we want for 2022. Longer L (365
+  days) preserves it but at the cost of slower edge response.
+
+L = 200 is a deliberate match to the bear-regime duration we're
+trying to detect.
+
+*** Effort estimate
+
+Tier 2 emission upgrade (univariate → trivariate Gaussian): ~250
+lines as estimated for the bivariate case, plus ~30 lines for the
+drawdown computation and lookback handling.
+
+Tier 3 transition upgrade (constant A → VIX-driven softmax A): ~150
+lines for the logistic-regression M-step (scipy IRLS is enough;
+Pólya-Gamma not needed unless going full Bayesian), plus a one-time
+VIX fetch (~20 lines, ~yfinance.download("^VIX")~).
+
+Combined Tier 2+3 is ~450 lines on top of the existing notebook —
+comparable to the existing code size and tractable in a single
+follow-up session.
+
+** What we should *not* change in the follow-up
+
+- Pass criterion. The 2022-bear-posterior ≥ 0.6 / flips ≤ 6 / gap-or-
+  reduction ≥ 0.15 rule worked: it correctly flagged the original run
+  as a substantive FAIL despite the rule-based "BORDERLINE". Keep it.
+- Restart strategy. 1D-aware k-means + jitter is fine; for multivariate
+  observations we get richer init for free.
+- Window. 2021-06 → 2023-06 is the test case the original plan
+  committed to. Even though paper 3 uses a longer window, expanding
+  ours would conflate the methodology question (does the *fix* work)
+  with a data-availability question.
+- Comparison frame. Apples-to-apples Gaussian vs Student-t under
+  shared forward-backward / init / restart / convergence rule. This
+  is what made the original notebook's verdict credible despite
+  being negative; the follow-up should keep it.
+
+* Suggested next action
+
+Run *Tier 1, change #1* (log-price observation, K = 2 and K = 3,
+Gaussian + Student-t) as Phase-0.5a, in the same notebook style. It
+is the smallest possible change to our existing code that responds to
+the most-cited finding in the literature (paper 2's choice to model
+the level not the return). Estimated effort: ≤ half a day.
+
+If it passes the pass criterion, roll forward (resume the original
+seven-day plan, optionally adding K = 4 multivariate as a robustness
+check). If it fails, run *Tier 1, change #2* (K = 4) as Phase-0.5b;
+this is the second cheapest and is independently endorsed by paper 3
+as the structurally right answer for BTC.
+
+Only if both Tier-1 changes fail should we escalate to the bivariate
+emission (Tier 2) or NH-HMM (Tier 3). At that point the question is
+no longer "can a simple HMM see 2022 as a bear" but "what is the
+*minimum* model complexity required" — which is a different and more
+ambitious paper.
