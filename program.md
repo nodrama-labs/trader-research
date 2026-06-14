@@ -30,6 +30,12 @@ On startup, read these files for context:
 - `data/vix_daily.csv` — VIX daily over the same window (transition
   covariate for NH-HMM variants).
 - `data/consensus_labels.tsv` — ground-truth regime period table.
+- `references/literature_review.org` — distilled review of the four
+  regime-switching / HMM crypto papers (PDFs alongside it): per-paper
+  "what it implies for our setup", a failures→fixes mapping, and
+  follow-up ideas **ranked by code-reuse vs. likelihood-of-pass** (Tier
+  1-3). **Draw new hypotheses and Phase-3 experiment proposals from
+  here** (together with the hypothesis pool under "Research directions").
 
 If a stale `results/regime_sweep_results.tsv` exists from a prior run,
 move it aside
@@ -161,7 +167,8 @@ If `exp_002` does NOT beat `exp_001`: *ablation branch*:
 experiments that close remaining ambiguities, or move toward Student-t
 emissions (paper 3) / semi-Markov sojourn (paper 4) variants if the
 mass of evidence suggests they're worth trying. You may also draw from
-the **hypothesis pool** below. Stop when (a) a winner has been
+the **hypothesis pool** below and the ranked Tier 1-3 follow-ups in
+`references/literature_review.org`. Stop when (a) a winner has been
 established AND its dominant components have been ablated, or (b) the
 human interrupts.
 
