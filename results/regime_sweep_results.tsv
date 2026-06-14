@@ -1,3 +1,5 @@
 experiment_id	observation	K	emission	transitions	regime_score	score_2018_bear	score_2020q1_covid	score_bull_2020_2021	score_2022_bear	score_2024_etf_bull	ll_mean	argmax_acc	flip_count	comment
 exp_001_baseline	drawdown_200	3	gaussian	homogeneous	0.284996	0.494031	0.009483	0.971985	0.868865	0.985223	nan	0.532704	39	Baseline: K=3 Gaussian on rolling-200 drawdown, mu-sort labelling. From regime_drawdown_2022.org.
 exp_002_proposal_k3	trivar_r_vol5_dd200	3	mvn_full	nh_softmax_vix	0.516812	0.638185	0.211477	0.735270	0.907952	0.848428	nan	0.473942	86	Proposal: K=3 full-Sigma MVN on (r,vol5,dd200), NH-HMM softmax(VIX). Return-sort labelling.
+exp_004_diag_sigma	trivar_r_vol5_dd200	3	mvn_diag	nh_softmax_vix	0.703855	0.698479	0.755346	0.788158	0.884139	0.974219	nan	0.544246	132	Phase2 robustness: exp_002 with diagonal Sigma. Do cross-channel covariance terms earn their keep?
+exp_003_proposal_k4	trivar_r_vol5_dd200	4	mvn_full	nh_softmax_vix	0.666463	0.706992	0.624658	0.709576	0.901327	0.965196	nan	0.514516	96	Phase2 robustness: exp_002 at K=4. Does a 4th state earn under misclassification? thirds-bucket labels.
