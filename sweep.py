@@ -1245,6 +1245,28 @@ def run_exp_009_diag_pinned() -> None:
     )
 
 
+def run_exp_010_diag_homog() -> None:
+    """Phase-3 ablation of the winner (exp_004 = K=3 diagonal-Σ MVN, trivariate,
+    NH-VIX): drop the transition back to HOMOGENEOUS, holding everything else.
+
+    Isolates whether the softmax-VIX transition still earns its complexity once the
+    emission covariance is diagonal. Diagonal Σ alone already lifted COVID hugely
+    (full-Σ exp_002 0.211 → diag exp_004 0.755), so this asks how much of exp_004's
+    skill is the NH transition vs the diagonal emission — i.e. is NH still pulling
+    its weight, or did diagonalizing the covariance make it redundant?"""
+    factory = make_proposal_factory(K=3, n_restarts_cold=3, cov_type="diag",
+                                    transitions="homog")
+    harness.evaluate(
+        experiment_id="exp_010_diag_homog",
+        model_factory=factory,
+        observation="trivar_r_vol5_dd200",
+        K=3,
+        emission="mvn_diag",
+        transitions="homogeneous",
+        comment="Phase3 ablation: winner exp_004 minus NH (diag trivariate, homogeneous A). Does NH-VIX still earn with diagonal Sigma?",
+    )
+
+
 def run_exp_005_mvt_homog() -> None:
     """Phase 3: K=3 multivariate Student-t (full scale Σ, per-state dof ν) on
     (rₜ, σₜ^{5d}, dₜ_{200}) with homogeneous transitions.
@@ -1310,6 +1332,7 @@ EXPERIMENTS = {
     "exp_007_diag_ddsort": run_exp_007_diag_ddsort,
     "exp_008_diag_vixgate": run_exp_008_diag_vixgate,
     "exp_009_diag_pinned": run_exp_009_diag_pinned,
+    "exp_010_diag_homog": run_exp_010_diag_homog,
 }
 
 
